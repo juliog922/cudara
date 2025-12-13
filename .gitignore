@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Domain specific
+models/
+temp_uploads/
+registry.json
+
+# uv
+uv.lock

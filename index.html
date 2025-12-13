@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cudara | CUDA Inference Server</title>
+    <meta name="description" content="Self-hosted inference server for HuggingFace models. Ollama-compatible API for LLMs, Vision, and Speech.">
+    
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    
+    <style>
+        /* --- RESET & VARS --- */
+        :root {
+            --color-cuda: #76b900;
+            --color-bg: #020617;
+            --color-bg-panel: rgba(30, 41, 59, 0.4);
+            --color-text-main: #cbd5e1;
+            --color-border: rgba(255, 255, 255, 0.08);
+            --font-sans: 'Inter', system-ui, sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        
+        body {
+            background-color: var(--color-bg);
+            color: var(--color-text-main);
+            font-family: var(--font-sans);
+            line-height: 1.6;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow-x: hidden;
+        }
+
+        a { text-decoration: none; color: inherit; transition: color 0.2s; }
+        
+        /* --- UTILITIES --- */
+        .container { max-width: 1100px; margin: 0 auto; padding: 0 1.5rem; }
+        .flex-center { display: flex; align-items: center; justify-content: center; }
+        .flex-between { display: flex; align-items: center; justify-content: space-between; }
+        .text-center { text-align: center; }
+        
+        /* --- ANIMATIONS --- */
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+        @keyframes pulseGlow { 0%, 100% { opacity: 0.5; transform: scale(0.9); } 50% { opacity: 0.9; transform: scale(1.1); } }
+        
+        .animate-fade { animation: fadeIn 0.8s ease-out forwards; }
+        .animate-blink { animation: blink 1s step-end infinite; }
+
+        /* --- CANVAS BG --- */
+        #canvas-container {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            z-index: -1; opacity: 0.5; pointer-events: none;
+        }
+
+        /* --- COMPONENTS --- */
+        .dev-banner {
+            background: rgba(245, 158, 11, 0.1);
+            border-bottom: 1px solid rgba(245, 158, 11, 0.2);
+            color: #f59e0b; font-size: 0.75rem; font-weight: 500;
+            padding: 0.5rem; text-align: center; backdrop-filter: blur(4px);
+        }
+        .status-dot {
+            display: inline-block; width: 8px; height: 8px;
+            background-color: #f59e0b; border-radius: 50%; margin-right: 8px;
+            animation: blink 2s infinite;
+        }
+
+        /* Navbar & Logo */
+        nav {
+            position: sticky; top: 0; z-index: 50;
+            background: rgba(2, 6, 23, 0.85); backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--color-border); height: 64px;
+        }
+        .nav-content { height: 100%; }
+        
+        .logo { 
+            font-weight: 700; color: #fff; font-size: 1.25rem;
+            display: flex; align-items: center; gap: 0.75rem; 
+            letter-spacing: -0.03em; position: relative;
+        }
+        .logo-icon-container {
+            position: relative; width: 36px; height: 36px;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .logo-glow {
+            position: absolute; inset: 0;
+            background: radial-gradient(circle, rgba(118, 185, 0, 0.4) 0%, transparent 70%);
+            filter: blur(5px); z-index: 0; opacity: 0.8;
+            animation: pulseGlow 3s ease-in-out infinite;
+        }
+        .logo-svg {
+            position: relative; z-index: 1; width: 100%; height: 100%;
+            filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3));
+        }
+
+        .nav-links { display: flex; gap: 1.5rem; font-size: 0.875rem; font-weight: 500; }
+        .nav-links a:hover { color: var(--color-cuda); }
+        
+        /* Hero */
+        .hero { padding: 5rem 1rem 4rem; position: relative; z-index: 10; }
+        h1 {
+            font-size: clamp(2.5rem, 5vw, 4rem); font-weight: 800; line-height: 1.1;
+            color: white; margin-bottom: 1.5rem; letter-spacing: -0.02em;
+        }
+        .text-gradient {
+            background: linear-gradient(to right, #76b900, #34d399);
+            -webkit-background-clip: text; background-clip: text;
+            -webkit-text-fill-color: transparent; color: transparent;
+        }
+        .hero p { font-size: 1.125rem; color: #94a3b8; max-width: 650px; margin: 0 auto 3rem; }
+        .hero p strong { color: #f1f5f9; font-weight: 600; }
+
+        /* Command Box */
+        .cmd-box {
+            background: rgba(15, 23, 42, 0.8);
+            border: 1px solid #334155; border-radius: 8px;
+            padding: 0.75rem 1rem; display: inline-flex; align-items: center; gap: 1rem;
+            font-family: var(--font-mono); font-size: 0.875rem; color: #e2e8f0;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); cursor: pointer;
+            transition: all 0.3s ease; max-width: 100%;
+        }
+        .cmd-box:hover { border-color: rgba(118, 185, 0, 0.5); box-shadow: 0 0 15px rgba(118, 185, 0, 0.15); }
+        .prompt { color: var(--color-cuda); user-select: none; }
+        
+        /* Grid */
+        .features-grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1.5rem; margin-top: 4rem; margin-bottom: 6rem;
+        }
+        .card {
+            background: var(--color-bg-panel); backdrop-filter: blur(12px);
+            border: 1px solid var(--color-border); border-radius: 12px;
+            padding: 2rem; transition: transform 0.3s ease, background 0.3s ease;
+        }
+        .card:hover { transform: translateY(-4px); background: rgba(30, 41, 59, 0.6); }
+        .card h3 { color: white; margin-bottom: 0.5rem; font-size: 1.125rem; }
+        .card p { font-size: 0.9rem; color: #94a3b8; }
+        .icon-box {
+            width: 48px; height: 48px; border-radius: 8px;
+            display: flex; align-items: center; justify-content: center;
+            margin-bottom: 1.5rem; font-size: 1.5rem;
+            background: rgba(255,255,255,0.05); color: var(--color-cuda);
+        }
+
+        /* --- CODE SECTION --- */
+        .code-section { margin-bottom: 6rem; }
+        .section-header { margin-bottom: 2rem; }
+        .section-title { font-size: 2rem; font-weight: 700; color: white; margin-bottom: 0.5rem; }
+        .section-subtitle { color: #94a3b8; }
+
+        .code-window {
+            background: #0f172a; border: 1px solid #334155;
+            border-radius: 12px; overflow: hidden;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.3);
+        }
+        .window-header {
+            background: #1e293b; padding: 0.75rem 1rem;
+            display: flex; justify-content: space-between; align-items: center;
+            border-bottom: 1px solid #334155;
+        }
+        .window-dots { display: flex; gap: 6px; }
+        .dot { width: 10px; height: 10px; border-radius: 50%; }
+        .dot-r { background: #ef4444; } .dot-y { background: #f59e0b; } .dot-g { background: #22c55e; }
+        
+        .tabs { display: flex; gap: 4px; background: #0f172a; padding: 4px; border-radius: 6px; }
+        .tab-btn {
+            background: transparent; border: none; color: #64748b;
+            padding: 6px 16px; font-size: 0.85rem; font-weight: 500;
+            border-radius: 4px; cursor: pointer; transition: all 0.2s;
+        }
+        .tab-btn:hover { color: #fff; }
+        .tab-btn.active { background: #334155; color: #fff; }
+
+        .code-content { padding: 1.5rem; font-family: var(--font-mono); font-size: 0.9rem; position: relative; }
+        .code-pane { display: none; }
+        .code-pane.active { display: block; animation: fadeIn 0.3s ease-out; }
+        
+        /* Syntax Highlighting */
+        .c-cmd { color: #f59e0b; } .c-arg { color: #cbd5e1; } .c-str { color: #86efac; }
+        .c-opt { color: #93c5fd; } .c-comment { color: #64748b; font-style: italic; display: block; margin-bottom: 0.5rem;}
+        
+        .copy-code {
+            position: absolute; top: 1rem; right: 1rem;
+            background: rgba(255,255,255,0.1); border: none;
+            color: #fff; padding: 6px; border-radius: 4px;
+            cursor: pointer; opacity: 0; transition: opacity 0.2s;
+        }
+        .code-content:hover .copy-code { opacity: 1; }
+
+        footer {
+            margin-top: auto; border-top: 1px solid var(--color-border);
+            background: rgba(2, 6, 23, 0.9); padding: 2rem 0;
+            text-align: center; font-size: 0.875rem; color: #64748b;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="canvas-container">
+        <canvas id="neural-bg"></canvas>
+    </div>
+
+    <div class="dev-banner">
+        <span class="status-dot"></span>
+        Active Development (Alpha) &mdash; API Stability expected in v1.0
+    </div>
+
+    <nav>
+        <div class="container nav-content flex-between">
+            <div class="logo">
+                <div class="logo-icon-container">
+                    <div class="logo-glow"></div>
+                    <svg class="logo-svg" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M20 2L35.5885 11V29L20 38L4.41154 29V11L20 2Z" stroke="url(#cuda-gradient)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M24 14H18C15.7909 14 14 15.7909 14 18V22C14 24.2091 15.7909 26 18 26H24" stroke="white" stroke-width="2.5" stroke-linecap="round"/>
+                        <circle cx="26" cy="14" r="2" fill="url(#cuda-gradient)"/>
+                        <defs><linearGradient id="cuda-gradient" x1="4" y1="2" x2="35" y2="38" gradientUnits="userSpaceOnUse"><stop stop-color="#76b900"/><stop offset="1" stop-color="#34d399"/></linearGradient></defs>
+                    </svg>
+                </div>
+                <span>Cud<span style="color: #cbd5e1;">ara</span></span>
+            </div>
+            <div class="nav-links">
+                <a href="/docs">API Docs</a>
+                <a href="https://github.com/juliog922/cudara" target="_blank" class="flex-center" style="gap:6px">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <section class="hero text-center">
+            <h1 class="animate-fade">
+                Stop fighting with <br>
+                <span id="typewriter" class="text-gradient"></span><span class="cursor animate-blink" style="color:var(--color-cuda)">|</span>
+            </h1>
+            
+            <p class="animate-fade" style="animation-delay: 0.2s;">
+                Standardize your AI infrastructure. Run LLMs, Vision, and Whisper on <strong>NVIDIA GPUs</strong> with a single <strong>Ollama-compatible API</strong>.
+            </p>
+
+            <div class="cmd-box" onclick="copyText('docker run --gpus all -p 8000:8000 ghcr.io/juliog922/cudara:latest')" style="margin-top: 2rem;">
+                <span class="prompt">$</span>
+                <span style="color:#e2e8f0">docker run --gpus all -p 8000:8000 ghcr.io/juliog922/cudara:latest</span>
+            </div>
+            <div style="font-family:var(--font-mono); font-size:0.75rem; color:#64748b; margin-top:0.5rem;">
+                <span style="color:#f59e0b">Requires NVIDIA GPU (CUDA Only)</span> • CUDA 12.9+
+            </div>
+        </section>
+
+        <div class="features-grid animate-fade" style="animation-delay: 0.4s;">
+            <div class="card">
+                <div class="icon-box"><svg width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path></svg></div>
+                <h3>Unified Interface</h3>
+                <p>One single, optimized server for Chat, Vision, and Audio tasks. No more scattered Python scripts.</p>
+            </div>
+            <div class="card">
+                <div class="icon-box"><svg width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg></div>
+                <h3>Hardware Aware</h3>
+                <p>Auto-quantization (4-bit) and idle offloading to maximize efficiency on <strong>NVIDIA</strong> cards. (<strong>CUDA support only</strong>).</p>
+            </div>
+            <div class="card">
+                <div class="icon-box"><svg width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="16"></line><line x1="8" y1="12" x2="16" y2="12"></line></svg></div>
+                <h3>Drop-in Compatible</h3>
+                <p>Fully compliant with the Ollama API. Works with existing web UIs and CLI tools immediately.</p>
+            </div>
+        </div>
+
+        <section id="how-it-works" class="code-section animate-fade" style="animation-delay: 0.6s;">
+            <div class="section-header text-center">
+                <h2 class="section-title">One API, Any Modality</h2>
+                <p class="section-subtitle">Interact using standard HTTP requests or the Client SDK.</p>
+            </div>
+
+            <div class="code-window">
+                <div class="window-header">
+                    <div class="window-dots">
+                        <div class="dot dot-r"></div><div class="dot dot-y"></div><div class="dot dot-g"></div>
+                    </div>
+                    <div class="tabs">
+                        <button class="tab-btn active" onclick="switchTab(event, 'pull')">Pull Model</button>
+                        <button class="tab-btn" onclick="switchTab(event, 'chat')">Chat / Text</button>
+                        <button class="tab-btn" onclick="switchTab(event, 'vision')">Vision</button>
+                        <button class="tab-btn" onclick="switchTab(event, 'audio')">Audio</button>
+                    </div>
+                </div>
+                
+                <div class="code-content">
+                    <button class="copy-code" onclick="copyActiveCode()">Copy</button>
+                    
+                    <div id="pull" class="code-pane active">
+                        <span class="c-comment"># Download/Pull a model from HuggingFace</span><br>
+                        <span class="c-cmd">curl</span> <span class="c-opt">-X POST</span> <span class="c-str">http://localhost:8000/api/pull</span> \<br>
+                        &nbsp;&nbsp;<span class="c-opt">-H</span> <span class="c-str">"Content-Type: application/json"</span> \<br>
+                        &nbsp;&nbsp;<span class="c-opt">-d</span> '{ <span class="c-arg">"name"</span>: <span class="c-str">"Qwen/Qwen2.5-3B-Instruct"</span> }'
+                    </div>
+
+                    <div id="chat" class="code-pane">
+                        <span class="c-comment"># Generate text or chat with LLMs (Ollama compatible)</span><br>
+                        <span class="c-cmd">curl</span> <span class="c-opt">-X POST</span> <span class="c-str">http://localhost:8000/api/chat</span> \<br>
+                        &nbsp;&nbsp;<span class="c-opt">-H</span> <span class="c-str">"Content-Type: application/json"</span> \<br>
+                        &nbsp;&nbsp;<span class="c-opt">-d</span> '{<br>
+                        &nbsp;&nbsp;&nbsp;&nbsp;<span class="c-arg">"model"</span>: <span class="c-str">"Qwen/Qwen2.5-3B-Instruct"</span>,<br>
+                        &nbsp;&nbsp;&nbsp;&nbsp;<span class="c-arg">"messages"</span>: [<br>
+                        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{ <span class="c-arg">"role"</span>: <span class="c-str">"user"</span>, <span class="c-arg">"content"</span>: <span class="c-str">"Write a python script to scan ports"</span> }<br>
+                        &nbsp;&nbsp;&nbsp;&nbsp;]<br>
+                        &nbsp;&nbsp;}'
+                    </div>
+
+                    <div id="vision" class="code-pane">
+                        <span class="c-comment"># Analyze images with Vision Language Models (VLM)</span><br>
+                        <span class="c-cmd">curl</span> <span class="c-opt">-X POST</span> <span class="c-str">http://localhost:8000/api/vision</span> \<br>
+                        &nbsp;&nbsp;<span class="c-opt">-F</span> <span class="c-str">"model=unsloth/Qwen2.5-VL-3B-Instruct-unsloth-bnb-4bit"</span> \<br>
+                        &nbsp;&nbsp;<span class="c-opt">-F</span> <span class="c-str">"prompt=Extract text from this invoice"</span> \<br>
+                        &nbsp;&nbsp;<span class="c-opt">-F</span> <span class="c-str">"file=@invoice.jpg"</span>
+                    </div>
+
+                    <div id="audio" class="code-pane">
+                        <span class="c-comment"># Transcribe audio files using Whisper</span><br>
+                        <span class="c-cmd">curl</span> <span class="c-opt">-X POST</span> <span class="c-str">http://localhost:8000/api/transcribe</span> \<br>
+                        &nbsp;&nbsp;<span class="c-opt">-F</span> <span class="c-str">"model=openai/whisper-small"</span> \<br>
+                        &nbsp;&nbsp;<span class="c-opt">-F</span> <span class="c-str">"file=@meeting_recording.mp3"</span>
+                    </div>
+
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+    <footer>
+        <div class="container">
+            <p>&copy; 2025 Cudara. <a href="https://github.com/juliog922/cudara">View Source on GitHub</a></p>
+        </div>
+    </footer>
+
+    <script>
+        // --- Typewriter ---
+        const textToType = "Inference APIs.";
+        const typeElement = document.getElementById('typewriter');
+        let charIndex = 0;
+        setTimeout(function type() {
+            if (charIndex < textToType.length) {
+                typeElement.textContent += textToType.charAt(charIndex++);
+                setTimeout(type, 100);
+            }
+        }, 500);
+
+        // --- Tab Switching ---
+        function switchTab(evt, tabId) {
+            const tabs = document.querySelectorAll('.code-pane');
+            const btns = document.querySelectorAll('.tab-btn');
+            tabs.forEach(t => t.classList.remove('active'));
+            btns.forEach(b => b.classList.remove('active'));
+            document.getElementById(tabId).classList.add('active');
+            evt.currentTarget.classList.add('active');
+        }
+
+        // --- Copy Functions ---
+        function copyText(text) {
+            navigator.clipboard.writeText(text);
+            const btn = document.querySelector('.cmd-box');
+            btn.style.borderColor = '#76b900';
+            setTimeout(() => btn.style.borderColor = '#334155', 500);
+        }
+
+        function copyActiveCode() {
+            const activePane = document.querySelector('.code-pane.active');
+            navigator.clipboard.writeText(activePane.innerText);
+            const btn = document.querySelector('.copy-code');
+            btn.textContent = "Copied!";
+            setTimeout(() => btn.textContent = "Copy", 2000);
+        }
+
+        // --- RESTORED MOUSE INTERACTION & NEURAL BACKGROUND ---
+        (function() {
+            const canvas = document.getElementById('neural-bg');
+            const ctx = canvas.getContext('2d');
+            let w, h, particles = [];
+            
+            // Interaction Config
+            const particleCount = 45;
+            const connectionDist = 140;
+            const mouseDist = 200;
+            const mouse = { x: null, y: null };
+
+            const resize = () => { w = canvas.width = window.innerWidth; h = canvas.height = window.innerHeight; };
+            window.addEventListener('resize', resize);
+            resize();
+
+            // Particle Setup
+            for(let i=0; i<particleCount; i++) {
+                particles.push({
+                    x: Math.random()*w, 
+                    y: Math.random()*h, 
+                    vx: (Math.random()-.5)*0.5, 
+                    vy: (Math.random()-.5)*0.5,
+                    size: Math.random()*2 + 1
+                });
+            }
+
+            function animate() {
+                ctx.clearRect(0,0,w,h);
+                
+                particles.forEach((p, i) => {
+                    // Update position
+                    p.x += p.vx; 
+                    p.y += p.vy;
+
+                    // Bounce off edges
+                    if(p.x < 0 || p.x > w) p.vx *= -1; 
+                    if(p.y < 0 || p.y > h) p.vy *= -1;
+
+                    // Mouse Interaction
+                    if (mouse.x != null) {
+                        const dx = mouse.x - p.x;
+                        const dy = mouse.y - p.y;
+                        const dist = Math.sqrt(dx*dx + dy*dy);
+                        if (dist < mouseDist) {
+                            // Gentle attraction to mouse
+                            const force = (mouseDist - dist) / mouseDist;
+                            p.x += dx * force * 0.02;
+                            p.y += dy * force * 0.02;
+                        }
+                    }
+
+                    // Draw Particle
+                    ctx.fillStyle='rgba(118,185,0,0.3)'; 
+                    ctx.beginPath(); 
+                    ctx.arc(p.x, p.y, p.size, 0, Math.PI*2); 
+                    ctx.fill();
+
+                    // Draw Connections
+                    for (let j = i + 1; j < particles.length; j++) {
+                        const p2 = particles[j];
+                        const dx = p.x - p2.x;
+                        const dy = p.y - p2.y;
+                        const dist = Math.sqrt(dx*dx + dy*dy);
+                        
+                        if(dist < connectionDist) {
+                            ctx.strokeStyle=`rgba(118,185,0,${0.15*(1-dist/connectionDist)})`;
+                            ctx.beginPath(); 
+                            ctx.moveTo(p.x, p.y); 
+                            ctx.lineTo(p2.x, p2.y); 
+                            ctx.stroke();
+                        }
+                    }
+                });
+                requestAnimationFrame(animate);
+            }
+
+            // Mouse Event Listeners
+            window.addEventListener('mousemove', e => {
+                mouse.x = e.clientX;
+                mouse.y = e.clientY;
+            });
+            window.addEventListener('mouseleave', () => {
+                mouse.x = null;
+                mouse.y = null;
+            });
+
+            animate();
+        })();
+    </script>
+</body>
+</html>

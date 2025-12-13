@@ -1,0 +1,120 @@
+[project]
+name = "cudara"
+version = "1.0.0"
+description = "Lightweight CUDA inference server with Ollama-compatible API"
+readme = "README.md"
+license = {text = "MIT"}
+keywords = ["inference", "cuda", "llm", "vlm", "embeddings", "asr", "ollama", "huggingface"]
+authors = [
+    {name = "Julio Galindo" }
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Framework :: FastAPI",
+]
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate",
+    "bitsandbytes",
+    "datasets>=4.4.1",
+    "fastapi>=0.119.1",
+    "httpx>=0.28.1",
+    "huggingface-hub>=0.30.0,<1.0",
+    "llama-cpp-python>=0.3.16",
+    "numpy",
+    "pillow",
+    "pydantic>=2.12.3",
+    "python-multipart>=0.0.20",
+    "qwen-vl-utils>=0.0.14",
+    "scipy",
+    "torch>=2.9.1",
+    "torchaudio>=2.9.1",
+    "torchvision>=0.24.1",
+    "transformers>=4.51.0",
+    "uvicorn>=0.38.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "httpx>=0.26.0",
+    "ruff>=0.2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/juliog922/cudara"
+Repository = "https://github.com/juliog922/cudara"
+Documentation = "https://github.com/juliog922/cudara#readme"
+Issues = "https://github.com/juliog922/cudara/issues"
+
+[project.scripts]
+cudara = "src.cudara.cli:main"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/models.json",
+    "/swagger.yaml",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cudara"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.2.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu129" }]
+torchvision = [{ index = "pytorch-cu129" }]
+torchaudio = [{ index = "pytorch-cu129" }]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-v --tb=short"
+markers = [
+    "unit: Unit tests (fast, no external dependencies)",
+    "integration: Integration tests (require running server)",
+    "slow: Slow tests (model loading, inference)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.coverage.run]
+source = ["src/cudara"]
+omit = ["tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
