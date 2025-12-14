@@ -33,6 +33,20 @@ docker run --gpus all -p 8000:8000 \
   ghcr.io/juliog922/cudara:latest
 ```
 
+## Building the Docker image (GPU targets)
+
+GitHub Actions runs on CPU-only runners by default (no NVIDIA GPU). This is OK: the image can still be built because NVCC compilation does not require a GPU. The GPU is only required when running the container.
+
+### Important (CUDA 12.9)
+Do NOT build with `CMAKE_CUDA_ARCHITECTURES=all` on CUDA 12.9 because it can fail during compilation (CCCL/CUB macro error). Build for specific architectures instead.
+
+### RTX 3060 (sm_86)
+RTX 3060 has compute capability 8.6 (sm_86). Build like this:
+
+```bash
+docker buildx build -t cudara:local --build-arg CUDA_ARCHS=86 --load .
+docker run --gpus all -p 8000:8000 cudara:local
+
 ### Using uv (Development)
 
 ```bash

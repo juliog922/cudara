@@ -55,6 +55,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
+            CUDA_ARCHS=86
             VERSION=${{ github.ref_name }}
             COMMIT_SHA=${{ github.sha }}
 

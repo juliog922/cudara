@@ -3,10 +3,11 @@ Test Configuration
 ==================
 Sets up the environment for tests, ensuring the 'src' directory is discoverable.
 """
-import sys
-import os
+
 import json
+import sys
 from pathlib import Path
+
 import pytest
 
 # Add 'src' to sys.path to allow importing 'cudara' directly
@@ -20,22 +21,18 @@ if str(ROOT_DIR) not in sys.path:
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+
 @pytest.fixture
 def mock_models_json(tmp_path):
     """Create a temporary models.json for testing."""
     p = tmp_path / "models.json"
     content = {
-        "test-org/test-model": {
-            "task": "text-generation",
-            "quantization": {"enabled": False}
-        },
-        "test-org/test-vlm": {
-            "task": "image-to-text",
-            "image_processing": {"min_pixels": 100}
-        }
+        "test-org/test-model": {"task": "text-generation", "quantization": {"enabled": False}},
+        "test-org/test-vlm": {"task": "image-to-text", "image_processing": {"min_pixels": 100}},
     }
     p.write_text(json.dumps(content))
     return p
+
 
 @pytest.fixture
 def temp_dir(tmp_path):

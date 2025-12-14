@@ -6,38 +6,47 @@
 # =============================================================================
 
 # Stage 1: Build llama-cpp-python with CUDA support
-FROM nvidia/cuda:12.1.1-devel-ubuntu22.04 AS builder
+FROM nvidia/cuda:12.9.1-devel-ubuntu24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Install build dependencies
+# software-properties-common: for add-apt-repository
+# git, cmake, build-essential: for compiling llama.cpp
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.12 \
-    python3.12-dev \
-    python3.12-venv \
-    python3-pip \
+    software-properties-common \
     build-essential \
     cmake \
     git \
     curl \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:$PATH"
+# Install uv (fast package manager)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
-# Create venv
+# Create virtual environment
 RUN python3.12 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Build llama-cpp-python with CUDA
-ENV CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=all"
+# Compilation Flags
+# We link against the system CUDA in this stage.
+# In the next stage, we will "trick" the binary to find these libs in the PyTorch folder.
+ARG CUDA_ARCHS="86"
+ENV CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS}"
 ENV FORCE_CMAKE=1
+
+# Install llama-cpp-python
 RUN uv pip install --no-cache-dir llama-cpp-python==0.3.16
 
 # =============================================================================
 # Stage 2: Runtime image
 # =============================================================================
-FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
+FROM nvidia/cuda:12.9.1-runtime-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -89,10 +98,10 @@ RUN uv pip install --no-cache-dir \
     "uvicorn>=0.38.0" \
     httpx
 
-# Install PyTorch with CUDA 12.1
+# Install PyTorch with CUDA 12.9
 RUN uv pip install --no-cache-dir \
     torch torchvision torchaudio \
-    --index-url https://download.pytorch.org/whl/cu121
+    --index-url https://download.pytorch.org/whl/cu129
 
 # Install cudara package in editable mode
 RUN uv pip install --no-cache-dir -e .
