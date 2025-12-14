@@ -992,7 +992,9 @@ class InferenceEngine:
 
             if config.task != "automatic-speech-recognition":
                 raise AppError(
-                    f"Model {model_id} is not an ASR model", 400, {"code": ErrorCode.INVALID_REQUEST}
+                    f"Model {model_id} is not an ASR model",
+                    400,
+                    {"code": ErrorCode.INVALID_REQUEST},
                 )
 
             options = options or {}
@@ -1006,7 +1008,9 @@ class InferenceEngine:
             generate_kwargs.pop("return_token_timestamps", None)
 
             try:
-                res = self.active_pipeline(audio_path, generate_kwargs=generate_kwargs, **pipeline_args)
+                res = self.active_pipeline(
+                    audio_path, generate_kwargs=generate_kwargs, **pipeline_args
+                )
                 if isinstance(res, list):
                     text = " ".join([c.get("text", "") for c in res])
                 elif isinstance(res, dict):
@@ -1020,7 +1024,9 @@ class InferenceEngine:
                     "total_duration": int((time.perf_counter() - start) * 1e9),
                 }
             except Exception as e:
-                raise AppError(f"Transcription failed: {e}", 500, {"code": ErrorCode.INFERENCE_ERROR})
+                raise AppError(
+                    f"Transcription failed: {e}", 500, {"code": ErrorCode.INFERENCE_ERROR}
+                )
 
 
 # =============================================================================
