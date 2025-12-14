@@ -217,7 +217,7 @@ COPY src/ src/
 # CUDA PyTorch (cu129)
 RUN uv pip install --no-cache-dir \
     torch torchvision torchaudio \
-    --index-url https://download.pytorch.org/whl/cu1299
+    --index-url https://download.pytorch.org/whl/cu129
 
 # Install dependencies (llama-cpp-python already installed)
 RUN uv pip install --no-cache-dir \
