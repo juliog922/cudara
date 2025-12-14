@@ -214,6 +214,11 @@ WORKDIR /app
 COPY pyproject.toml .
 COPY src/ src/
 
+# CUDA PyTorch (cu129)
+RUN uv pip install --no-cache-dir \
+    torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu1299
+
 # Install dependencies (llama-cpp-python already installed)
 RUN uv pip install --no-cache-dir \
     accelerate \
@@ -230,11 +235,6 @@ RUN uv pip install --no-cache-dir \
     "transformers>=4.51.0" \
     "uvicorn>=0.38.0" \
     httpx
-
-# CUDA PyTorch (cu129)
-RUN uv pip install --no-cache-dir \
-    torch torchvision torchaudio \
-    --index-url https://download.pytorch.org/whl/cu129
 
 # Install cudara package in editable mode
 RUN uv pip install --no-cache-dir -e .
