@@ -113,12 +113,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Docker image (test only)
+      - name: Build Docker image (CPU target for CI)
         uses: docker/build-push-action@v6
         with:
           context: .
           push: false
-          tags: cudara:test
+          target: runtime-cpu
+          tags: cudara:test-cpu
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

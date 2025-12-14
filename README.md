@@ -24,16 +24,28 @@ Cudara is a self-hosted inference server for HuggingFace models. Run LLMs, Visio
 ### Using Docker (Recommended)
 
 ```bash
-# Pull and run
+# GPU (CUDA image)
 docker run --gpus all -p 8000:8000 ghcr.io/juliog922/cudara:latest
 
-# With persistent models
+# GPU (with persistent models)
 docker run --gpus all -p 8000:8000 \
   -v cudara_models:/app/models \
   ghcr.io/juliog922/cudara:latest
+
+# CPU-only (for environments without NVIDIA runtime)
+docker run -p 8000:8000 ghcr.io/juliog922/cudara:cpu
 ```
 
-## Building the Docker image (GPU targets)
+## Docker images and tags
+
+This repo publishes two variants:
+
+- **CUDA image**: `ghcr.io/juliog922/cudara:latest` (alias `:cuda` on the default branch)
+- **CPU-only image**: `ghcr.io/juliog922/cudara:cpu`
+
+The CUDA image will use the GPU when you run the container with `--gpus all`.
+
+## Building the Docker images (CPU + CUDA)
 
 GitHub Actions runs on CPU-only runners by default (no NVIDIA GPU). This is OK: the image can still be built because NVCC compilation does not require a GPU. The GPU is only required when running the container.
 
@@ -44,8 +56,13 @@ Do NOT build with `CMAKE_CUDA_ARCHITECTURES=all` on CUDA 12.9 because it can fai
 RTX 3060 has compute capability 8.6 (sm_86). Build like this:
 
 ```bash
-docker buildx build -t cudara:local --build-arg CUDA_ARCHS=86 --load .
-docker run --gpus all -p 8000:8000 cudara:local
+docker buildx build -t cudara:cuda --build-arg CUDA_ARCHS=86 --load .
+docker run --gpus all -p 8000:8000 cudara:cuda
+
+# CPU-only build (matches what CI builds for workflow tests)
+docker buildx build --target runtime-cpu -t cudara:cpu --load .
+docker run -p 8000:8000 cudara:cpu
+```
 
 ### Using uv (Development)
 
@@ -252,8 +269,13 @@ uv run ruff format src/ tests/
 ### Build Docker
 
 ```bash
-docker build -t cudara:latest .
-docker run --gpus all -p 8000:8000 cudara:latest
+# CUDA (default target)
+docker build -t cudara:cuda .
+docker run --gpus all -p 8000:8000 cudara:cuda
+
+# CPU-only
+docker build --target runtime-cpu -t cudara:cpu .
+docker run -p 8000:8000 cudara:cpu
 ```
 
 ---
