@@ -15,5 +15,4 @@ temp_uploads/
 registry.json
 
 # uv
-uv.lock
 .ruff_cache
