@@ -31,36 +31,29 @@ docker run --gpus all -p 8000:8000 \
   -v cudara_models:/app/models \
   ghcr.io/juliog922/cudara:latest
 
-# CPU-only (for environments without NVIDIA runtime)
-docker run -p 8000:8000 ghcr.io/juliog922/cudara:cpu
+# Auto-download models on startup (and keep /health unhealthy until they are ready)
+docker run --gpus all -p 8000:8000 \
+  -e CUDARA_DEFAULT_MODELS="Qwen/Qwen2.5-3B-Instruct,openai/whisper-small" \
+  -e HF_TOKEN="..." \
+  -v cudara_models:/app/models \
+  ghcr.io/juliog922/cudara:latest
 ```
 
 ## Docker images and tags
 
-This repo publishes two variants:
+This repo publishes a single **CUDA** image:
 
-- **CUDA image**: `ghcr.io/juliog922/cudara:latest` (alias `:cuda` on the default branch)
-- **CPU-only image**: `ghcr.io/juliog922/cudara:cpu`
+- `ghcr.io/juliog922/cudara:latest` (alias `:cuda` on the default branch)
 
-The CUDA image will use the GPU when you run the container with `--gpus all`.
+Run it with the NVIDIA runtime (for Docker: `--gpus all`).
 
-## Building the Docker images (CPU + CUDA)
+## Building the Docker image (CUDA)
 
-GitHub Actions runs on CPU-only runners by default (no NVIDIA GPU). This is OK: the image can still be built because NVCC compilation does not require a GPU. The GPU is only required when running the container.
-
-### Important (CUDA 12.9)
-Do NOT build with `CMAKE_CUDA_ARCHITECTURES=all` on CUDA 12.9 because it can fail during compilation (CCCL/CUB macro error). Build for specific architectures instead.
-
-### RTX 3060 (sm_86)
-RTX 3060 has compute capability 8.6 (sm_86). Build like this:
+GitHub Actions runners typically don’t have NVIDIA GPUs, but that’s fine: the **CUDA image can be built without a GPU**. A GPU is only required to *run* the container.
 
 ```bash
-docker buildx build -t cudara:cuda --build-arg CUDA_ARCHS=86 --load .
+docker build -t cudara:cuda .
 docker run --gpus all -p 8000:8000 cudara:cuda
-
-# CPU-only build (matches what CI builds for workflow tests)
-docker buildx build --target runtime-cpu -t cudara:cpu --load .
-docker run -p 8000:8000 cudara:cpu
 ```
 
 ### Using uv (Development)
@@ -257,13 +250,8 @@ uv run ruff format src/ tests/
 ### Build Docker
 
 ```bash
-# CUDA (default target)
 docker build -t cudara:cuda .
 docker run --gpus all -p 8000:8000 cudara:cuda
-
-# CPU-only
-docker build --target runtime-cpu -t cudara:cpu .
-docker run -p 8000:8000 cudara:cpu
 ```
 
 ---
@@ -273,7 +261,7 @@ docker run -p 8000:8000 cudara:cpu
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HF_TOKEN` | HuggingFace token for gated models | - |
-| `CUDARA_DEFAULT_MODELS` | Comma-separated model IDs from `models.json` to auto-download on startup; `/health` stays unhealthy until they are READY | (unset) |
+| `CUDARA_DEFAULT_MODELS` | Comma-separated model IDs from `models.json` to auto-download on startup; if unset/empty/`None`, it is disabled. `/health` stays unhealthy until all requested models are READY | (unset / None) |
 | `CUDA_VISIBLE_DEVICES` | GPU selection | all |
 
 ---

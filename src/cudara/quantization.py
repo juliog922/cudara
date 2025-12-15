@@ -1,15 +1,9 @@
 """
 Quantization System for Cudara
 ==============================
-Uses BitsAndBytes for quantization - no calibration needed, works out of the box.
-
-Model Categories:
-- text_llm_small: <4B params - use 4-bit with careful skip_modules
-- text_llm_medium: 4B-13B params - optimal for 4-bit
-- text_llm_large: >13B params - very robust to quantization
-- vlm_small/medium/large: Vision-Language Models
-- asr: Speech recognition - NO quantization
-- embedding: Embeddings - NO quantization
+Implements 'Dynamic' quantization strategies using BitsAndBytes.
+Configuration is strictly driven by input arguments and 'models.json',
+avoiding hardcoded model-specific logic in Python.
 """
 
 import gc
@@ -25,7 +19,6 @@ from typing import Any, Dict, List, Optional
 import torch
 import transformers
 from transformers import (
-    AutoConfig,
     AutoModelForCausalLM,
     AutoProcessor,
     AutoTokenizer,
@@ -37,17 +30,16 @@ logger = logging.getLogger(__name__)
 
 class ModelCategory(str, Enum):
     """
-    Categorization of models for applying optimal quantization profiles.
+    Generic model categories.
+    Specific requirements (e.g., Qwen vs Llama skips) must be defined
+    via 'skip_modules' in the quantization config, not here.
     """
 
-    TEXT_LLM_SMALL = "text_llm_small"
-    TEXT_LLM_MEDIUM = "text_llm_medium"
-    TEXT_LLM_LARGE = "text_llm_large"
-    VLM_SMALL = "vlm_small"
-    VLM_MEDIUM = "vlm_medium"
-    VLM_LARGE = "vlm_large"
+    TEXT_LLM = "text_llm"
+    VLM = "vlm"
     ASR = "asr"
     EMBEDDING = "embedding"
+    UNKNOWN = "unknown"
 
 
 class QuantizationMethod(str, Enum):
@@ -61,194 +53,64 @@ class QuantizationMethod(str, Enum):
 class QuantizationConfig:
     """
     Quantization settings for a model.
-
-    Attributes
-    ----------
-    method : QuantizationMethod
-        Backend to use.
-    bits : int
-        Target bit depth (4 or 8).
-    skip_modules : List[str]
-        Modules to exclude from quantization for stability.
-    use_double_quant : bool
-        Whether to use nested quantization (BnB feature).
     """
 
     method: QuantizationMethod = QuantizationMethod.BITSANDBYTES
     bits: int = 4
     skip_modules: List[str] = field(default_factory=list)
     use_double_quant: bool = True
+    quant_type: str = "nf4"
 
 
-# Profiles optimized for different model categories
+# Default Profiles
+# These are fallback defaults. Specific models should define 'skip_modules'
+# in models.json if they deviate from these defaults.
 QUANTIZATION_PROFILES: Dict[ModelCategory, QuantizationConfig] = {
-    ModelCategory.TEXT_LLM_SMALL: QuantizationConfig(
+    ModelCategory.TEXT_LLM: QuantizationConfig(
         method=QuantizationMethod.BITSANDBYTES,
         bits=4,
         skip_modules=["lm_head", "embed_tokens"],
         use_double_quant=True,
     ),
-    ModelCategory.TEXT_LLM_MEDIUM: QuantizationConfig(
+    ModelCategory.VLM: QuantizationConfig(
         method=QuantizationMethod.BITSANDBYTES,
         bits=4,
-        skip_modules=["lm_head"],
-        use_double_quant=True,
-    ),
-    ModelCategory.TEXT_LLM_LARGE: QuantizationConfig(
-        method=QuantizationMethod.BITSANDBYTES,
-        bits=4,
-        skip_modules=["lm_head"],
-        use_double_quant=True,
-    ),
-    ModelCategory.VLM_SMALL: QuantizationConfig(
-        method=QuantizationMethod.BITSANDBYTES,
-        bits=4,
-        skip_modules=[
-            "lm_head",
-            "visual",
-            "vision_tower",
-            "vision_model",
-            "multi_modal_projector",
-            "merger",
-            "patch_embed",
-            "model.layers.0",
-            "model.layers.1",
-            "model.layers.2",
-            "model.layers.3",
-        ],
-        use_double_quant=True,
-    ),
-    ModelCategory.VLM_MEDIUM: QuantizationConfig(
-        method=QuantizationMethod.BITSANDBYTES,
-        bits=4,
-        skip_modules=[
-            "lm_head",
-            "visual",
-            "vision_tower",
-            "vision_model",
-            "multi_modal_projector",
-            "merger",
-            "model.layers.0",
-            "model.layers.1",
-        ],
-        use_double_quant=True,
-    ),
-    ModelCategory.VLM_LARGE: QuantizationConfig(
-        method=QuantizationMethod.BITSANDBYTES,
-        bits=4,
-        skip_modules=["lm_head", "visual", "vision_tower", "multi_modal_projector"],
+        # Safe defaults for most VLMs.
+        # For Llama 3.2 Vision, add 'cross_attn' to skip_modules in models.json.
+        # For Qwen-VL, add 'merger'/'vision_tower' to skip_modules in models.json.
+        skip_modules=["lm_head", "embed_tokens", "vision_model", "vision_tower"],
         use_double_quant=True,
     ),
     ModelCategory.ASR: QuantizationConfig(method=QuantizationMethod.NONE),
     ModelCategory.EMBEDDING: QuantizationConfig(method=QuantizationMethod.NONE),
+    ModelCategory.UNKNOWN: QuantizationConfig(
+        method=QuantizationMethod.BITSANDBYTES, bits=4, skip_modules=["lm_head"]
+    ),
 }
 
 
-def estimate_model_size(model_id: str, config: Optional[AutoConfig] = None) -> float:
+def detect_model_category(task: Optional[str] = None) -> ModelCategory:
     """
-    Estimate model size in billions of parameters.
-
-    Parameters
-    ----------
-    model_id : str
-        Model identifier string.
-    config : AutoConfig, optional
-        Loaded model configuration.
-
-    Returns
-    -------
-    float
-        Estimated size in Billions (e.g., 7.0 for 7B).
+    Detect generic model category based on task.
+    Does NOT use model name sniffing.
     """
-    model_id_lower = model_id.lower()
+    if not task:
+        return ModelCategory.TEXT_LLM
 
-    patterns = {
-        "0.5b": 0.5,
-        "1b": 1,
-        "1.5b": 1.5,
-        "1.7b": 1.7,
-        "2b": 2,
-        "3b": 3,
-        "4b": 4,
-        "7b": 7,
-        "8b": 8,
-        "9b": 9,
-        "11b": 11,
-        "12b": 12,
-        "13b": 13,
-        "14b": 14,
-        "32b": 32,
-        "34b": 34,
-        "70b": 70,
-        "72b": 72,
-    }
-
-    for pattern, size in patterns.items():
-        if pattern in model_id_lower:
-            return size
-
-    if config:
-        try:
-            hidden = getattr(config, "hidden_size", 4096)
-            layers = getattr(config, "num_hidden_layers", 32)
-            vocab = getattr(config, "vocab_size", 32000)
-            return (hidden * hidden * 4 * layers + hidden * vocab * 2) / 1e9
-        except Exception:
-            pass
-
-    return 7.0
-
-
-def detect_model_category(
-    model_id: str, task: Optional[str] = None, config: Optional[AutoConfig] = None
-) -> ModelCategory:
-    """
-    Detect model category from ID and task for profiling.
-
-    Parameters
-    ----------
-    model_id : str
-        Model name.
-    task : str, optional
-        HF task type.
-    config : AutoConfig, optional
-        Model configuration.
-
-    Returns
-    -------
-    ModelCategory
-        Detected category.
-    """
-    model_id_lower = model_id.lower()
-
-    if task == "automatic-speech-recognition" or "whisper" in model_id_lower:
+    if task == "automatic-speech-recognition":
         return ModelCategory.ASR
 
-    embedding_hints = ["embedding", "minilm", "bge", "e5", "sentence-transformer", "gte"]
-    if task == "feature-extraction" or any(h in model_id_lower for h in embedding_hints):
+    if task == "feature-extraction":
         return ModelCategory.EMBEDDING
 
-    vlm_hints = ["vl", "vision", "vlm", "ocr", "pixtral", "llava", "cogvlm", "internvl", "molmo"]
-    is_vlm = any(h in model_id_lower for h in vlm_hints)
+    if task == "image-to-text":
+        return ModelCategory.VLM
 
-    size = estimate_model_size(model_id, config)
-
-    if is_vlm:
-        if size < 4:
-            return ModelCategory.VLM_SMALL
-        elif size < 15:
-            return ModelCategory.VLM_MEDIUM
-        return ModelCategory.VLM_LARGE
-    else:
-        if size < 4:
-            return ModelCategory.TEXT_LLM_SMALL
-        elif size < 13:
-            return ModelCategory.TEXT_LLM_MEDIUM
-        return ModelCategory.TEXT_LLM_LARGE
+    return ModelCategory.TEXT_LLM
 
 
 class BitsAndBytesQuantizer:
-    """BitsAndBytes quantizer - works without calibration data."""
+    """BitsAndBytes quantizer wrapper implementing NF4 and Double Quantization."""
 
     @staticmethod
     def is_available() -> bool:
@@ -264,34 +126,17 @@ class BitsAndBytesQuantizer:
         architecture: str = "AutoModelForCausalLM",
     ) -> Dict[str, Any]:
         """
-        Quantize model using BitsAndBytes.
-
-        Parameters
-        ----------
-        model_path : Path
-            Input model directory.
-        output_path : Path
-            Output directory for quantized weights.
-        config : QuantizationConfig
-            Quantization parameters.
-        trust_remote_code : bool
-            Allow custom code execution.
-        architecture : str
-            Model class name (e.g. AutoModelForCausalLM).
-
-        Returns
-        -------
-        Dict
-            Metadata about the operation.
+        Quantize model using BitsAndBytes with NF4 and BFloat16 computation.
         """
-        logger.info(f"Quantizing with BnB {config.bits}-bit...")
+        logger.info(f"Quantizing with BnB {config.bits}-bit (NF4)...")
 
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        # Use BFloat16 if available for stability
+        compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
         if config.bits == 4:
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
-                bnb_4bit_compute_dtype=dtype,
+                bnb_4bit_compute_dtype=compute_dtype,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_use_double_quant=config.use_double_quant,
                 llm_int8_skip_modules=config.skip_modules if config.skip_modules else None,
@@ -304,19 +149,21 @@ class BitsAndBytesQuantizer:
 
         model_cls = getattr(transformers, architecture, AutoModelForCausalLM)
 
-        model = model_cls.from_pretrained(
-            str(model_path),
-            quantization_config=bnb_config,
-            device_map="auto",
-            torch_dtype=dtype,
-            trust_remote_code=trust_remote_code,
-            low_cpu_mem_usage=True,
-        )
+        # Load into memory (RAM -> VRAM during quantization)
+        with torch.no_grad():
+            model = model_cls.from_pretrained(
+                str(model_path),
+                quantization_config=bnb_config,
+                device_map="auto",
+                torch_dtype=compute_dtype,
+                trust_remote_code=trust_remote_code,
+                low_cpu_mem_usage=True,
+            )
 
         output_path.mkdir(parents=True, exist_ok=True)
         model.save_pretrained(str(output_path), safe_serialization=True)
 
-        # Save processor/tokenizer
+        # Save processor/tokenizer artifacts
         try:
             processor = load_processor_with_fallback(model_path, trust_remote_code)
             processor.save_pretrained(str(output_path))
@@ -327,18 +174,19 @@ class BitsAndBytesQuantizer:
                 )
                 tokenizer.save_pretrained(str(output_path))
             except Exception:
-                pass
+                logger.warning("Could not save tokenizer/processor artifacts.")
 
         return {
             "method": "bitsandbytes",
             "bits": config.bits,
-            "quant_type": "nf4" if config.bits == 4 else "int8",
+            "quant_type": "nf4",
             "double_quant": config.use_double_quant,
+            "skipped_modules": config.skip_modules,
         }
 
 
 class ModelQuantizer:
-    """Main quantizer facade class."""
+    """Main facade for the quantization system."""
 
     def __init__(self, models_dir: Path):
         self.models_dir = models_dir
@@ -357,44 +205,33 @@ class ModelQuantizer:
         task: str = "text-generation",
         trust_remote_code: bool = False,
         architecture: str = "AutoModelForCausalLM",
+        custom_config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Pre-quantize a model with optimal settings based on its category.
-
-        Parameters
-        ----------
-        model_id : str
-            Model identifier.
-        source_path : Path
-            Path to downloaded raw model.
-        target_path : Path
-            Path to save quantized model.
-        task : str
-            HF task type.
-        trust_remote_code : bool
-            Allow custom code.
-        architecture : str
-            Model class name.
-
-        Returns
-        -------
-        Dict
-            Result metadata including 'quantized' boolean.
+        Pre-quantize a model.
+        Prioritizes settings from 'custom_config' (from models.json) over defaults.
         """
-        try:
-            config = AutoConfig.from_pretrained(
-                str(source_path), trust_remote_code=trust_remote_code
-            )
-        except Exception:
-            config = None
+        category = detect_model_category(task=task)
 
-        category = detect_model_category(model_id, task=task, config=config)
-        profile = QUANTIZATION_PROFILES.get(
-            category, QUANTIZATION_PROFILES[ModelCategory.TEXT_LLM_MEDIUM]
-        )
+        # Start with default profile
+        profile = QUANTIZATION_PROFILES.get(category, QUANTIZATION_PROFILES[ModelCategory.UNKNOWN])
 
-        logger.info(f"Category: {category.value}, Profile: {profile.bits}-bit")
+        # Apply overrides from models.json
+        if custom_config:
+            if "category" in custom_config:
+                # If explicit category provided in JSON (e.g. 'vlm_llama' mapped to VLM)
+                # currently we only have generic VLM, so we rely on skip_modules mostly.
+                pass
 
+            if "skip_modules" in custom_config and custom_config["skip_modules"]:
+                profile.skip_modules = custom_config["skip_modules"]
+
+            if "bits" in custom_config:
+                profile.bits = custom_config["bits"]
+
+        logger.info(f"Strategy: {category.value} | Skip: {profile.skip_modules}")
+
+        # Handle 'NONE' or missing backend
         if profile.method == QuantizationMethod.NONE:
             logger.info("Quantization disabled for this model type")
             if source_path != target_path:
@@ -418,6 +255,7 @@ class ModelQuantizer:
 
             self._copy_additional_files(source_path, target_path, trust_remote_code)
 
+            # Cleanup
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -431,6 +269,8 @@ class ModelQuantizer:
         except Exception as e:
             logger.error(f"Quantization failed: {e}")
             if source_path != target_path:
+                if target_path.exists():
+                    shutil.rmtree(target_path)
                 shutil.copytree(source_path, target_path, dirs_exist_ok=True)
             return {"quantized": False, "category": category.value, "error": str(e)}
 
@@ -444,6 +284,7 @@ class ModelQuantizer:
             "chat_template.json",
             "tokenizer_config.json",
             "tokenizer.json",
+            "added_tokens.json",
         ]
 
         for f in files:
@@ -463,7 +304,7 @@ class ModelQuantizer:
 # PROCESSOR UTILITIES
 # =============================================================================
 
-QWEN_2_VL_CHAT_TEMPLATE = (
+QWEN_VL_TEMPLATE = (
     "{% set image_count = namespace(value=0) %}{% set video_count = namespace(value=0) %}"
     "{% for message in messages %}"
     "{% if loop.first and messages[0]['role'] != 'system' %}<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n{% endif %}"
@@ -480,17 +321,8 @@ QWEN_2_VL_CHAT_TEMPLATE = (
 
 def ensure_video_preprocessor_json(model_path: Path) -> bool:
     """
-    Create video_preprocessor.json for Qwen-VL models if missing.
-
-    Parameters
-    ----------
-    model_path : Path
-        Directory containing model files.
-
-    Returns
-    -------
-    bool
-        True if file exists or was created.
+    Ensure video configuration exists.
+    Checks config content rather than model name to decide logic.
     """
     video_config = model_path / "video_preprocessor.json"
     preproc_config = model_path / "preprocessor_config.json"
@@ -505,7 +337,9 @@ def ensure_video_preprocessor_json(model_path: Path) -> bool:
         with open(preproc_config, "r") as f:
             config = json.load(f)
 
-        if "qwen2" in config.get("processor_class", "").lower():
+        # Check for Qwen-specific class in the config file, not the model name
+        proc_class = config.get("processor_class", "").lower()
+        if "qwen2" in proc_class and "video" not in proc_class:
             with open(video_config, "w") as f:
                 json.dump(
                     {
@@ -526,16 +360,7 @@ def ensure_video_preprocessor_json(model_path: Path) -> bool:
 
 
 def sync_token_ids_with_tokenizer(model, tokenizer) -> None:
-    """
-    Sync model config token IDs with tokenizer to fix Qwen/Vision issues.
-
-    Parameters
-    ----------
-    model : AutoModel
-        Loaded model instance.
-    tokenizer : AutoTokenizer
-        Loaded tokenizer instance.
-    """
+    """Sync model config token IDs with tokenizer."""
     if not hasattr(model, "config"):
         return
 
@@ -556,28 +381,16 @@ def sync_token_ids_with_tokenizer(model, tokenizer) -> None:
 
         if hasattr(model.config, attr):
             setattr(model.config, attr, real_id)
-        if hasattr(tokenizer, attr):
-            setattr(tokenizer, attr, real_id)
 
 
 def load_processor_with_fallback(model_path: Path, trust_remote_code: bool = False):
     """
-    Load processor with robust fallback handling for VLMs.
-
-    Parameters
-    ----------
-    model_path : Path
-        Directory containing model files.
-    trust_remote_code : bool
-        Allow custom code execution.
-
-    Returns
-    -------
-    Any
-        Processor instance or wrapper.
+    Load processor with generic fallbacks.
+    Does not rely on hardcoded model names in the logic flow.
     """
     ensure_video_preprocessor_json(model_path)
 
+    # 1. Try Standard AutoProcessor
     try:
         processor = AutoProcessor.from_pretrained(
             str(model_path), trust_remote_code=trust_remote_code
@@ -585,11 +398,13 @@ def load_processor_with_fallback(model_path: Path, trust_remote_code: bool = Fal
         _ensure_chat_template(processor)
         return processor
     except (TypeError, ValueError):
-        pass
+        logger.debug("AutoProcessor failed, attempting component load.")
 
+    # 2. Try Component Loading (Common for VLMs)
     try:
-        from transformers import AutoImageProcessor, AutoTokenizer, Qwen2VLProcessor
+        from transformers import AutoImageProcessor, AutoTokenizer
 
+        # Load components separately
         image_proc = AutoImageProcessor.from_pretrained(
             str(model_path), trust_remote_code=trust_remote_code
         )
@@ -597,78 +412,53 @@ def load_processor_with_fallback(model_path: Path, trust_remote_code: bool = Fal
             str(model_path), trust_remote_code=trust_remote_code
         )
 
+        # Try to find a specialized processor dynamically
+        # This part requires specific imports but we guard them
         try:
-            from transformers import Qwen2VLVideoProcessor
+            from transformers import Qwen2VLProcessor, Qwen2VLVideoProcessor
 
-            video_proc = Qwen2VLVideoProcessor.from_pretrained(str(model_path))
-        except Exception:
-            video_proc = None
+            try:
+                video_proc = Qwen2VLVideoProcessor.from_pretrained(str(model_path))
+            except Exception:
+                video_proc = None
 
-        if video_proc:
             processor = Qwen2VLProcessor(
                 image_processor=image_proc, tokenizer=tokenizer, video_processor=video_proc
             )
-        else:
-            try:
-                processor = Qwen2VLProcessor(image_processor=image_proc, tokenizer=tokenizer)
-            except Exception:
+            _ensure_chat_template(processor)
+            return processor
+        except ImportError:
+            pass
 
-                class MockVideo:
-                    def __call__(self, *a, **k):
-                        return {}
-
-                processor = Qwen2VLProcessor(
-                    image_processor=image_proc, tokenizer=tokenizer, video_processor=MockVideo()
-                )
-
-        _ensure_chat_template(processor)
-        return processor
+        # If no specialized processor class found, return wrapper
+        return _create_wrapper(image_proc, tokenizer)
 
     except Exception as e:
-        logger.warning(f"Using wrapper fallback: {e}")
-        from transformers import AutoImageProcessor, AutoTokenizer
+        logger.warning(f"Component loading failed: {e}. Falling back to text-only.")
+        from transformers import AutoTokenizer
 
         tok = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=trust_remote_code)
-        try:
-            img = AutoImageProcessor.from_pretrained(
-                str(model_path), trust_remote_code=trust_remote_code
-            )
-        except Exception:
-            img = None
-        return _create_wrapper(img, tok)
+        return _create_wrapper(None, tok)
 
 
 def _ensure_chat_template(proc):
+    """Inject template if missing (mostly for Qwen-like models)."""
     tok = getattr(proc, "tokenizer", proc)
     if not hasattr(tok, "chat_template") or not tok.chat_template:
-        tok.chat_template = QWEN_2_VL_CHAT_TEMPLATE
+        tok.chat_template = QWEN_VL_TEMPLATE
 
 
 def _create_wrapper(image_processor, tokenizer):
+    """Generic wrapper for separated tokenizer/image_processor."""
+
     class Wrapper:
         def __init__(self, ip, tok):
             self.image_processor = ip
             self.tokenizer = tok
-            self.chat_template = QWEN_2_VL_CHAT_TEMPLATE
-            for attr in ["pad_token", "pad_token_id", "eos_token", "eos_token_id"]:
-                if hasattr(tok, attr):
-                    setattr(self, attr, getattr(tok, attr))
+            self.chat_template = getattr(tok, "chat_template", QWEN_VL_TEMPLATE)
 
         def __call__(self, text=None, images=None, **kwargs):
-            from transformers import BatchFeature
-
-            res = {}
-            if text:
-                res.update(self.tokenizer(text, **kwargs))
-            if images and self.image_processor:
-                try:
-                    res.update(self.image_processor(images, return_tensors="pt"))
-                except Exception:
-                    pass
-            return BatchFeature(res)
-
-        def apply_chat_template(self, *args, **kwargs):
-            return self.tokenizer.apply_chat_template(*args, **kwargs)
+            return self.tokenizer(text, **kwargs)
 
         def batch_decode(self, *args, **kwargs):
             return self.tokenizer.batch_decode(*args, **kwargs)
