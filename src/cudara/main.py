@@ -19,13 +19,13 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
 import transformers
 from fastapi import BackgroundTasks, FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
-from huggingface_hub import hf_hub_download, login, snapshot_download
+from huggingface_hub import login, snapshot_download
 from PIL import Image
 from pydantic import BaseModel, Field
 from transformers import (
@@ -41,14 +41,6 @@ from src.cudara.quantization import (
     load_processor_with_fallback,
     sync_token_ids_with_tokenizer,
 )
-
-# GGUF Support
-try:
-    from llama_cpp import Llama
-
-    GGUF_AVAILABLE = True
-except ImportError:
-    GGUF_AVAILABLE = False
 
 # Suppress noisy warnings
 warnings.filterwarnings("ignore", message=".*num_logits_to_keep.*", category=FutureWarning)
@@ -264,7 +256,7 @@ class ModelConfig(BaseModel):
     task : str
         HF task identifier (text-generation, etc).
     backend : str
-        'transformers' or 'gguf'.
+        'transformers'.
     architecture : str
         Model class to load.
     quantization : QuantizationConfig
@@ -273,8 +265,7 @@ class ModelConfig(BaseModel):
 
     description: Optional[str] = None
     task: str = "feature-extraction"
-    backend: str = "transformers"
-    filename: Optional[str] = None
+    backend: Literal["transformers"] = "transformers"
     architecture: str = "AutoModel"
     dtype: str = "auto"
     trust_remote_code: bool = False
@@ -477,42 +468,33 @@ class ModelManager:
 
         try:
             logger.info(f"Downloading {model_id}...")
+            should_quantize = (
+                config.quantization
+                and config.quantization.enabled
+                and config.quantization.prequantize
+            )
+            dest = temp_dir if should_quantize else target_dir
+            snapshot_download(repo_id=model_id, local_dir=dest, token=HF_TOKEN)
 
-            if config.backend == "gguf":
-                if not config.filename:
-                    raise ValueError("Filename required for GGUF")
-                local_path = hf_hub_download(
-                    repo_id=model_id, filename=config.filename, local_dir=target_dir, token=HF_TOKEN
+            if should_quantize:
+                logger.info(f"Quantizing {model_id}...")
+                self.update_registry(model_id, ModelStatus.QUANTIZING)
+                res = self.quantizer.prequantize_model(
+                    model_id,
+                    temp_dir,
+                    target_dir,
+                    task=config.task,
+                    trust_remote_code=config.trust_remote_code,
+                    architecture=config.architecture,
                 )
-                self.update_registry(model_id, ModelStatus.READY, str(local_path), backend="gguf")
+                self.update_registry(
+                    model_id,
+                    ModelStatus.READY,
+                    str(target_dir),
+                    is_prequantized=res.get("quantized", False),
+                )
             else:
-                should_quantize = (
-                    config.quantization
-                    and config.quantization.enabled
-                    and config.quantization.prequantize
-                )
-                dest = temp_dir if should_quantize else target_dir
-                snapshot_download(repo_id=model_id, local_dir=dest, token=HF_TOKEN)
-
-                if should_quantize:
-                    logger.info(f"Quantizing {model_id}...")
-                    self.update_registry(model_id, ModelStatus.QUANTIZING)
-                    res = self.quantizer.prequantize_model(
-                        model_id,
-                        temp_dir,
-                        target_dir,
-                        task=config.task,
-                        trust_remote_code=config.trust_remote_code,
-                        architecture=config.architecture,
-                    )
-                    self.update_registry(
-                        model_id,
-                        ModelStatus.READY,
-                        str(target_dir),
-                        is_prequantized=res.get("quantized", False),
-                    )
-                else:
-                    self.update_registry(model_id, ModelStatus.READY, str(target_dir))
+                self.update_registry(model_id, ModelStatus.READY, str(target_dir))
 
             logger.info(f"✓ {model_id} ready")
 
@@ -573,7 +555,7 @@ class InferenceEngine:
     Features:
     - Lazy loading
     - Automatic unloading on idle (300s)
-    - Supports GGUF and Transformers
+    - Supports Transformers
     - Vision support
     - **Concurrency Safety**: Strict locking for GPU operations.
     """
@@ -659,35 +641,6 @@ class InferenceEngine:
 
         if self.active_pipeline:
             self._unload()
-
-        # GGUF Backend
-        if config.backend == "gguf":
-            if not GGUF_AVAILABLE:
-                raise AppError(
-                    "llama-cpp-python not installed", 500, {"code": ErrorCode.BACKEND_ERROR}
-                )
-
-            logger.info(f"Loading {model_id} (GGUF)...")
-            params = config.parameters or {}
-            is_vl = "vl" in model_id.lower() and "qwen" in model_id.lower()
-
-            try:
-                model = Llama(
-                    model_path=str(path),
-                    n_gpu_layers=params.get("n_gpu_layers", -1),
-                    n_ctx=params.get("n_ctx", 12288 if is_vl else 4096),
-                    n_batch=params.get("n_batch", 512),
-                    verbose=False,
-                    chat_format="qwen2-vl" if is_vl else None,
-                )
-                self.active_pipeline = model
-                self.active_model_id = model_id
-                self.active_config = config
-                logger.info(f"✓ {model_id} loaded")
-                return
-            except Exception as e:
-                raise AppError(f"GGUF load failed: {e}", 500, {"code": ErrorCode.BACKEND_ERROR})
-
         # Transformers Backend
         ensure_video_preprocessor_json(path)
         is_prequantized = self.manager.is_prequantized(model_id)
@@ -779,64 +732,11 @@ class InferenceEngine:
         """
         with self._inference_lock:
             self.load_model(model_id)
-            config = self.active_config
             start = time.perf_counter()
             self.last_access = time.time()
             options = options or {}
-
-            # GGUF
-            if config.backend == "gguf":
-                return self._generate_gguf(prompt, images, system, options, start)
-
             # Transformers
             return self._generate_transformers(prompt, images, system, options, start)
-
-    def _generate_gguf(self, prompt, images, system, options, start):
-        config = self.active_config
-        model = self.active_pipeline
-
-        messages = []
-        if system or config.system_prompt:
-            messages.append({"role": "system", "content": system or config.system_prompt})
-
-        user_content = []
-        if images and config.task == "image-to-text":
-            for img in images:
-                user_content.append(
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}}
-                )
-        if prompt:
-            user_content.append({"type": "text", "text": prompt})
-
-        if len(user_content) > 1 or (user_content and user_content[0].get("type") == "image_url"):
-            messages.append({"role": "user", "content": user_content})
-        else:
-            messages.append({"role": "user", "content": prompt or ""})
-
-        gen_params = {**(config.generation_defaults or {}), **options}
-
-        try:
-            output = model.create_chat_completion(
-                messages=messages,
-                max_tokens=gen_params.get("num_predict", gen_params.get("max_new_tokens", 256)),
-                temperature=gen_params.get("temperature", 0.7),
-                top_p=gen_params.get("top_p", 0.9),
-                stop=config.stop_strings or [],
-            )
-            result = self._clean_reasoning(output["choices"][0]["message"]["content"])
-            usage = output.get("usage", {})
-            elapsed = time.perf_counter() - start
-
-            return {
-                "model": self.active_model_id,
-                "created_at": datetime.now(timezone.utc).isoformat() + "Z",
-                "response": result,
-                "done": True,
-                "total_duration": int(elapsed * 1e9),
-                "eval_count": usage.get("completion_tokens", 0),
-            }
-        except Exception as e:
-            raise AppError(f"Generation failed: {e}", 500, {"code": ErrorCode.INFERENCE_ERROR})
 
     def _generate_transformers(self, prompt, images, system, options, start):
         config = self.active_config
@@ -1065,6 +965,127 @@ async def general_error_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content=error_response("internal_error", str(exc)))
 
 
+# =============================================================================
+# STARTUP DEFAULT MODELS
+# =============================================================================
+
+DEFAULT_MODELS_ENV = "CUDARA_DEFAULT_MODELS"
+
+
+def parse_default_models_env() -> Optional[List[str]]:
+    """
+    Parse the CUDARA_DEFAULT_MODELS environment variable.
+
+    Expected format: comma-separated model IDs (must exist in models.json).
+    Treats unset, empty, or "None" (case-insensitive) as disabled.
+    """
+    raw = os.getenv(DEFAULT_MODELS_ENV)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if raw == "" or raw.lower() == "none":
+        return None
+    models = [m.strip() for m in raw.split(",") if m.strip()]
+    return models or None
+
+
+def _download_default_models(models: List[str]):
+    """
+    Download default models sequentially in a background thread.
+
+    Health will remain unhealthy until all requested default models are READY.
+    """
+    for model_id in models:
+        try:
+            reg = manager.get_registry().get(model_id)
+            if reg and reg.status == ModelStatus.READY and not reg.error_message:
+                continue
+            manager.update_registry(model_id, ModelStatus.DOWNLOADING)
+            manager.download_model_task(model_id)
+        except Exception as e:
+            logger.error(f"Startup download failed for {model_id}: {e}")
+
+
+@app.on_event("startup")
+def startup_event():
+    requested = parse_default_models_env() or []
+    app.state.default_models_requested = requested
+    app.state.default_models_valid = []
+    app.state.default_models_invalid = []
+
+    if not requested:
+        return
+
+    allowed = manager.get_allowed_models()
+    invalid = [m for m in requested if m not in allowed]
+    valid = [m for m in requested if m in allowed]
+
+    app.state.default_models_valid = valid
+    app.state.default_models_invalid = invalid
+
+    if invalid:
+        logger.error(
+            f"{DEFAULT_MODELS_ENV} contains unknown model IDs (not in models.json): {', '.join(invalid)}"
+        )
+
+    if valid:
+        threading.Thread(target=_download_default_models, args=(valid,), daemon=True).start()
+
+
+def _build_health_payload() -> tuple[int, Dict[str, Any]]:
+    """
+    Build a health payload and status code.
+
+    If CUDARA_DEFAULT_MODELS is set, the server reports unhealthy (HTTP 503)
+    until all requested models are READY with no errors.
+    """
+    requested = getattr(app.state, "default_models_requested", []) or []
+    invalid = getattr(app.state, "default_models_invalid", []) or []
+
+    registry = manager.get_registry()
+    default_status: Dict[str, Any] = {}
+
+    ready = True
+    if requested:
+        for model_id in requested:
+            if model_id in invalid:
+                default_status[model_id] = {
+                    "status": "invalid",
+                    "error": "Model ID not found in models.json",
+                }
+                ready = False
+                continue
+
+            reg = registry.get(model_id)
+            if not reg:
+                default_status[model_id] = {"status": "not_downloaded"}
+                ready = False
+                continue
+
+            default_status[model_id] = {
+                "status": reg.status.value,
+                "error": reg.error_message,
+            }
+            if reg.status != ModelStatus.READY or reg.error_message:
+                ready = False
+
+    status_code = 200 if ready else 503
+
+    payload: Dict[str, Any] = {
+        "status": "ok" if ready else "unhealthy",
+        "version": "1.0.0",
+        "active_model": engine.active_model_id,
+        "cuda_available": torch.cuda.is_available(),
+        "vram_used": f"{torch.cuda.memory_allocated() / 1024**3:.1f}GB"
+        if torch.cuda.is_available()
+        else "0GB",
+        "default_models": requested,
+        "default_models_status": default_status,
+        "default_models_invalid": invalid,
+    }
+    return status_code, payload
+
+
 @app.get("/", tags=["UI"], summary="Landing Page", response_class=HTMLResponse)
 async def landing_page(request: Request):
     """
@@ -1077,7 +1098,8 @@ async def landing_page(request: Request):
     accept = (request.headers.get("accept") or "").lower()
     if "text/html" in accept and landing_file.exists():
         return HTMLResponse(content=landing_file.read_text(encoding="utf-8"))
-    return JSONResponse(content=health())
+    status_code, payload = _build_health_payload()
+    return JSONResponse(content=payload, status_code=status_code)
 
 
 @app.get(
@@ -1090,18 +1112,13 @@ def health():
     """
     **Health Check.**
 
-    Returns the running status, version, currently loaded model, and VRAM consumption.
-    Useful for readiness probes in container orchestrators.
+    Returns server status and VRAM usage.
+
+    If `CUDARA_DEFAULT_MODELS` is set, this endpoint reports HTTP 503 (unhealthy)
+    until all requested default models are downloaded and READY with no errors.
     """
-    return {
-        "status": "ok",
-        "version": "1.0.0",
-        "active_model": engine.active_model_id,
-        "cuda_available": torch.cuda.is_available(),
-        "vram_used": f"{torch.cuda.memory_allocated() / 1024**3:.1f}GB"
-        if torch.cuda.is_available()
-        else "0GB",
-    }
+    status_code, payload = _build_health_payload()
+    return JSONResponse(content=payload, status_code=status_code)
 
 
 @app.get("/api/tags", tags=["Models"], summary="List Models")

@@ -15,7 +15,6 @@ Cudara is a self-hosted inference server for HuggingFace models. Run LLMs, Visio
 - 📊 **Embeddings** - Vector embeddings for RAG and semantic search
 - 🎤 **Speech Recognition** - Transcribe audio with Whisper
 - ⚡ **Quantization** - Automatic 4-bit quantization via BitsAndBytes
-- 🔧 **GGUF Support** - Run GGUF models via llama.cpp
 
 ---
 
@@ -228,17 +227,6 @@ Edit `models.json` to add HuggingFace models:
 }
 ```
 
-### GGUF
-
-```json
-"org/model-GGUF": {
-  "task": "text-generation",
-  "backend": "gguf",
-  "filename": "model-Q4_K_M.gguf",
-  "parameters": {"n_gpu_layers": -1, "n_ctx": 8192}
-}
-```
-
 ---
 
 ## Development
@@ -285,6 +273,7 @@ docker run -p 8000:8000 cudara:cpu
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HF_TOKEN` | HuggingFace token for gated models | - |
+| `CUDARA_DEFAULT_MODELS` | Comma-separated model IDs from `models.json` to auto-download on startup; `/health` stays unhealthy until they are READY | (unset) |
 | `CUDA_VISIBLE_DEVICES` | GPU selection | all |
 
 ---
