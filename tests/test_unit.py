@@ -80,39 +80,29 @@ class TestQuantization:
         """Test model category detection for text models."""
         from src.cudara.quantization import ModelCategory, detect_model_category
 
-        # Small model
-        cat = detect_model_category("Qwen/Qwen2.5-3B-Instruct", task="text-generation")
-        assert cat == ModelCategory.TEXT_LLM_SMALL
-
-        # Medium model
-        cat = detect_model_category("Qwen/Qwen2.5-7B-Instruct", task="text-generation")
-        assert cat == ModelCategory.TEXT_LLM_MEDIUM
-
-        # Large model
-        cat = detect_model_category("meta-llama/Llama-3.3-70B-Instruct", task="text-generation")
-        assert cat == ModelCategory.TEXT_LLM_LARGE
+        # New logic only uses 'task', ignoring model name heuristics
+        cat = detect_model_category(task="text-generation")
+        assert cat == ModelCategory.TEXT_LLM
 
     def test_detect_model_category_vlm(self):
         """Test model category detection for VLMs."""
         from src.cudara.quantization import ModelCategory, detect_model_category
 
-        cat = detect_model_category("Qwen/Qwen2-VL-2B-Instruct", task="image-to-text")
-        assert cat == ModelCategory.VLM_SMALL
+        cat = detect_model_category(task="image-to-text")
+        assert cat == ModelCategory.VLM
 
     def test_detect_model_category_asr(self):
         """Test model category detection for ASR."""
         from src.cudara.quantization import ModelCategory, detect_model_category
 
-        cat = detect_model_category("openai/whisper-small", task="automatic-speech-recognition")
+        cat = detect_model_category(task="automatic-speech-recognition")
         assert cat == ModelCategory.ASR
 
     def test_detect_model_category_embedding(self):
         """Test model category detection for embeddings."""
         from src.cudara.quantization import ModelCategory, detect_model_category
 
-        cat = detect_model_category(
-            "sentence-transformers/all-MiniLM-L6-v2", task="feature-extraction"
-        )
+        cat = detect_model_category(task="feature-extraction")
         assert cat == ModelCategory.EMBEDDING
 
     def test_quantization_profiles_exist(self):
@@ -121,14 +111,6 @@ class TestQuantization:
 
         for category in ModelCategory:
             assert category in QUANTIZATION_PROFILES
-
-    def test_estimate_model_size(self):
-        """Test model size estimation from name."""
-        from src.cudara.quantization import estimate_model_size
-
-        assert estimate_model_size("model-3B") == 3.0
-        assert estimate_model_size("model-7b") == 7.0
-        assert estimate_model_size("model-70B-instruct") == 70.0
 
 
 class TestModels:

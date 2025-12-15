@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import warnings
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -930,45 +930,11 @@ class InferenceEngine:
 
 
 # =============================================================================
-# API
+# STARTUP LOGIC & LIFESPAN
 # =============================================================================
+
 manager = ModelManager()
 engine = InferenceEngine(manager)
-
-app = FastAPI(
-    title="Cudara",
-    description="""
-    **Lightweight CUDA inference server.** This API is compatible with the Ollama standard, allowing you to drop it in
-    as a replacement backend for existing tools.
-    """,
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    contact={
-        "name": "Cudara Maintainer",
-        "url": "https://github.com/juliog922/cudara",
-    },
-)
-
-
-@app.exception_handler(AppError)
-async def app_error_handler(request: Request, exc: AppError):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content=error_response(exc.details.get("code", "error"), exc.message),
-    )
-
-
-@app.exception_handler(Exception)
-async def general_error_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled: {exc}")
-    return JSONResponse(status_code=500, content=error_response("internal_error", str(exc)))
-
-
-# =============================================================================
-# STARTUP DEFAULT MODELS
-# =============================================================================
-
 DEFAULT_MODELS_ENV = "CUDARA_DEFAULT_MODELS"
 
 
@@ -992,7 +958,6 @@ def parse_default_models_env() -> Optional[List[str]]:
 def _download_default_models(models: List[str]):
     """
     Download default models sequentially in a background thread.
-
     Health will remain unhealthy until all requested default models are READY.
     """
     for model_id in models:
@@ -1006,30 +971,73 @@ def _download_default_models(models: List[str]):
             logger.error(f"Startup download failed for {model_id}: {e}")
 
 
-@app.on_event("startup")
-def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Application lifespan handler.
+    Handles startup tasks (downloading default models) and shutdown cleanup.
+    """
+    # Startup Logic
     requested = parse_default_models_env() or []
     app.state.default_models_requested = requested
     app.state.default_models_valid = []
     app.state.default_models_invalid = []
 
-    if not requested:
-        return
+    if requested:
+        allowed = manager.get_allowed_models()
+        invalid = [m for m in requested if m not in allowed]
+        valid = [m for m in requested if m in allowed]
 
-    allowed = manager.get_allowed_models()
-    invalid = [m for m in requested if m not in allowed]
-    valid = [m for m in requested if m in allowed]
+        app.state.default_models_valid = valid
+        app.state.default_models_invalid = invalid
 
-    app.state.default_models_valid = valid
-    app.state.default_models_invalid = invalid
+        if invalid:
+            logger.error(
+                f"{DEFAULT_MODELS_ENV} contains unknown model IDs (not in models.json): {', '.join(invalid)}"
+            )
 
-    if invalid:
-        logger.error(
-            f"{DEFAULT_MODELS_ENV} contains unknown model IDs (not in models.json): {', '.join(invalid)}"
-        )
+        if valid:
+            threading.Thread(target=_download_default_models, args=(valid,), daemon=True).start()
 
-    if valid:
-        threading.Thread(target=_download_default_models, args=(valid,), daemon=True).start()
+    yield  # Application runs here
+
+    # Shutdown Logic (Cleanup if needed)
+    pass
+
+
+# =============================================================================
+# API
+# =============================================================================
+
+app = FastAPI(
+    title="Cudara",
+    description="""
+    **Lightweight CUDA inference server.** This API is compatible with the Ollama standard, allowing you to drop it in
+    as a replacement backend for existing tools.
+    """,
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    contact={
+        "name": "Cudara Maintainer",
+        "url": "https://github.com/juliog922/cudara",
+    },
+    lifespan=lifespan,
+)
+
+
+@app.exception_handler(AppError)
+async def app_error_handler(request: Request, exc: AppError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=error_response(exc.details.get("code", "error"), exc.message),
+    )
+
+
+@app.exception_handler(Exception)
+async def general_error_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled: {exc}")
+    return JSONResponse(status_code=500, content=error_response("internal_error", str(exc)))
 
 
 def _build_health_payload() -> tuple[int, Dict[str, Any]]:
