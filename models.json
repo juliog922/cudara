@@ -288,5 +288,14 @@
             "<|eot_id|>",
             "<|end_of_text|>"
         ]
-    }
+    },
+    "BAAI/bge-reranker-v2-m3": {
+        "description": "Cross-encoder reranker (returns relevance score).",
+        "task": "feature-extraction",
+        "architecture": "AutoModelForSequenceClassification",
+        "dtype": "float16",
+        "trust_remote_code": false,
+        "quantization": { "enabled": false },
+        "parameters": { "pair_sep": "\u241E" }
+        }
 }

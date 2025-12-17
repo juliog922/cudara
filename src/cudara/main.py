@@ -135,6 +135,7 @@ logger = setup_logging()
 # =============================================================================
 # CONFIG
 # =============================================================================
+PAIR_SEP_DEFAULT = "\u241e"
 HF_TOKEN: Optional[str] = os.getenv("HF_TOKEN")
 MODELS_DIR: Path = Path("models")
 REGISTRY_FILE: Path = Path("registry.json")
@@ -845,10 +846,6 @@ class InferenceEngine:
         return self.generate(model_id, last_msg.content, last_msg.images, system, options)
 
     def embeddings(self, model_id: str, texts: List[str], options: dict = None) -> dict:
-        """
-        Generate embeddings.
-        Strictly serialized.
-        """
         with self._inference_lock:
             self.load_model(model_id)
             config = self.active_config
@@ -856,22 +853,79 @@ class InferenceEngine:
             self.last_access = time.time()
 
             if config.task != "feature-extraction":
-                raise AppError(
-                    f"Model {model_id} is not an embedding model",
-                    400,
-                    {"code": ErrorCode.INVALID_REQUEST},
-                )
+                raise AppError(...)
 
-            model, tokenizer = self.active_pipeline
+            options = options or {}
+
+            # IMPORTANT: pipeline stores (model, processor), not guaranteed tokenizer
+            model, processor = self.active_pipeline
+            tokenizer = getattr(processor, "tokenizer", processor)
+
+            pair_sep = (
+                options.get("pair_sep")
+                or (config.parameters or {}).get("pair_sep")
+                or PAIR_SEP_DEFAULT
+            )
+            batch_size = int(options.get("batch_size", 16))
+            max_length = int(options.get("max_length", 512))
+
+            device = next(model.parameters()).device
+
             all_embeddings = []
 
-            for text in texts:
-                inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
-                inputs = {k: v.to("cuda") for k, v in inputs.items()}
+            for i in range(0, len(texts), batch_size):
+                chunk = texts[i : i + batch_size]
+
+                # Split into (query, doc) if separator exists
+                qs, ds = [], []
+                is_paired = False
+                for t in chunk:
+                    if pair_sep in t:
+                        q, d = t.split(pair_sep, 1)
+                        qs.append(q.strip())
+                        ds.append(d.strip())
+                        is_paired = True
+                    else:
+                        qs.append("")
+                        ds.append(t.strip())
+
+                if is_paired:
+                    inputs = tokenizer(
+                        qs,
+                        ds,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=max_length,
+                    )
+                else:
+                    inputs = tokenizer(
+                        chunk,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=max_length,
+                    )
+
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+
                 with torch.no_grad():
                     out = model(**inputs)
-                emb = out.last_hidden_state.mean(dim=1).float().cpu().numpy().tolist()[0]
-                all_embeddings.append(emb)
+
+                # RERANKER PATH: SequenceClassification models return logits
+                if hasattr(out, "logits") and out.logits is not None:
+                    logits = out.logits
+                    if logits.ndim == 2 and logits.shape[1] >= 2:
+                        scores = logits[:, -1]  # positive-class logit (common)
+                    else:
+                        scores = logits.view(-1)  # [B,1] -> [B]
+                    scores = scores.float().cpu().tolist()
+                    all_embeddings.extend([[float(s)] for s in scores])
+                else:
+                    # EMBEDDING PATH
+                    hs = out.last_hidden_state
+                    embs = hs.mean(dim=1).float().cpu().tolist()
+                    all_embeddings.extend(embs)
 
             return {
                 "model": model_id,

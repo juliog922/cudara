@@ -232,6 +232,24 @@ class TestEmbeddingsEndpoint:
         response = client.post("/api/embed", json={"model": "test/embedding", "input": "Hello"})
         assert response.status_code == 200
 
+    def test_embeddings_rerank_scores_shape_is_allowed(self, client, mock_engine):
+        """Option 2: server may return 1D vectors (scores) for reranker models via /api/embeddings."""
+
+        mock_engine.embeddings.return_value = {
+            "model": "test/reranker",
+            "embeddings": [[0.91], [0.12]],
+            "total_duration": 500000,
+        }
+
+        sep = "\u241e"
+        response = client.post(
+            "/api/embeddings",
+            json={"model": "test/reranker", "input": [f"q{sep}doc1", f"q{sep}doc2"]},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["embeddings"] == [[0.91], [0.12]]
+
 
 @pytest.mark.integration
 class TestLegacyEndpoints:
