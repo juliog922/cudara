@@ -48,7 +48,7 @@ FROM ${CUDA_IMAGE} AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3-minimal \
+    python3 \
     ca-certificates \
     ffmpeg \
     libsndfile1 \
