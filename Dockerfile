@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7-labs
 
-ARG CUDA_IMAGE=nvidia/cuda:12.9.1-base-ubuntu24.04
+ARG BUILD_IMAGE=nvidia/cuda:12.6.3-devel-ubuntu24.04
+ARG RUNTIME_IMAGE=nvidia/cuda:12.6.3-base-ubuntu24.04
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.9.17
 
 # Named stage (workaround for COPY --from not supporting variables)
@@ -9,7 +10,7 @@ FROM ${UV_IMAGE} AS uv
 ########################
 # Builder
 ########################
-FROM ${CUDA_IMAGE} AS builder
+FROM ${BUILD_IMAGE} AS builder
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -20,14 +21,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsndfile1 \
     libgomp1 \
+    git \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=uv /uv /uvx /bin/
 
 WORKDIR /app
 
-# Let uv create/use the project environment (default is /app/.venv)
-# Also: intermediate layers + cache mount = best practice for Docker builds with uv
 ENV UV_NO_DEV=1 \
     UV_LINK_MODE=copy \
     CMAKE_ARGS="-DGGML_CUDA=on"
@@ -46,7 +46,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ########################
 # Runtime
 ########################
-FROM ${CUDA_IMAGE} AS runtime
+FROM ${RUNTIME_IMAGE} AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
