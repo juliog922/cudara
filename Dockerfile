@@ -13,6 +13,7 @@ FROM ${CUDA_IMAGE} AS builder
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     python3-minimal \
     python3-venv \
     ca-certificates \
@@ -28,7 +29,8 @@ WORKDIR /app
 # Let uv create/use the project environment (default is /app/.venv)
 # Also: intermediate layers + cache mount = best practice for Docker builds with uv
 ENV UV_NO_DEV=1 \
-    UV_LINK_MODE=copy
+    UV_LINK_MODE=copy \
+    CMAKE_ARGS="-DGGML_CUDA=on"
 
 COPY pyproject.toml uv.lock ./
 

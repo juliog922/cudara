@@ -1,301 +1,43 @@
 {
     "_documentation": {
-        "how_to_add_models": "See README.md for detailed instructions",
-        "model_types": {
-            "text-generation": "Chat/completion LLMs (AutoModelForCausalLM)",
-            "image-to-text": "Vision-Language Models (AutoModelForImageTextToText)",
-            "feature-extraction": "Embedding models (AutoModel)",
-            "automatic-speech-recognition": "ASR models like Whisper"
+        "how_to_add_models": "For GGUF, specify 'filename'. Wildcards (*) allowed.",
+        "tasks": ["text-generation", "image-to-text", "feature-extraction", "automatic-speech-recognition"]
+    },
+    
+    "Qwen/Qwen2.5-3B-Instruct-GGUF": {
+        "description": "Generation model. GGUF Q4_K_M.",
+        "task": "text-generation",
+        "filename": "*q4_k_m.gguf",
+        "system_prompt": "You are Qwen, a helpful assistant.",
+        "generation_defaults": {
+            "n_ctx": 0,          
+            "n_gpu_layers": -1
+        }
+    },
+    "unsloth/Qwen2.5-VL-3B-Instruct-GGUF": {
+        "description": "Vision Language Model.",
+        "task": "image-to-text",
+        "filename": "*Q4_K_M.gguf",
+        "projector_filename": "*mmproj*.gguf",
+        "chat_handler": "llama_cpp.llama_chat_format.Qwen2VLChatHandler",
+        "generation_defaults": {
+            "n_ctx": 0,          
+            "n_gpu_layers": -1
         }
     },
     "sentence-transformers/all-MiniLM-L6-v2": {
-        "description": "Fast embedding model (384-dim). Ideal for RAG.",
+        "description": "Embeddings (Transformers backend).",
         "task": "feature-extraction",
-        "architecture": "AutoModel",
-        "dtype": "float32",
-        "trust_remote_code": false,
-        "quantization": {
-            "enabled": false
-        }
-    },
-    "BAAI/bge-base-en-v1.5": {
-        "description": "High-quality English embeddings (768-dim).",
-        "task": "feature-extraction",
-        "architecture": "AutoModel",
-        "dtype": "float32",
-        "trust_remote_code": false,
-        "quantization": {
-            "enabled": false
-        }
+        "backend": "transformers"
     },
     "openai/whisper-small": {
-        "description": "Whisper Small - Fast multilingual ASR. ~1GB VRAM.",
+        "description": "Whisper ASR (Transformers backend).",
         "task": "automatic-speech-recognition",
-        "architecture": "AutoModelForSpeechSeq2Seq",
-        "dtype": "float16",
-        "trust_remote_code": false,
-        "quantization": {
-            "enabled": false
-        },
-        "generation_defaults": {
-            "max_new_tokens": 440,
-            "num_beams": 1
-        }
-    },
-    "openai/whisper-large-v3": {
-        "description": "Whisper Large v3 - Best accuracy ASR. ~3GB VRAM.",
-        "task": "automatic-speech-recognition",
-        "architecture": "AutoModelForSpeechSeq2Seq",
-        "dtype": "float16",
-        "trust_remote_code": false,
-        "quantization": {
-            "enabled": false
-        },
-        "generation_defaults": {
-            "max_new_tokens": 440,
-            "num_beams": 1
-        }
-    },
-    "Qwen/Qwen2.5-3B-Instruct": {
-        "description": "Qwen2.5 3B - Excellent small multilingual chat. ~2GB VRAM.",
-        "task": "text-generation",
-        "architecture": "AutoModelForCausalLM",
-        "dtype": "bfloat16",
-        "trust_remote_code": false,
-        "quantization": {
-            "enabled": true,
-            "prequantize": true,
-            "method": "bitsandbytes",
-            "bits": 4,
-            "category": "text_llm_small",
-            "skip_modules": [
-                "lm_head",
-                "embed_tokens"
-            ]
-        },
-        "system_prompt": "You are a helpful assistant.",
-        "generation_defaults": {
-            "max_new_tokens": 512,
-            "do_sample": true,
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "repetition_penalty": 1.1
-        },
-        "stop_strings": [
-            "<|endoftext|>"
-        ]
-    },
-    "Qwen/Qwen2.5-7B-Instruct": {
-        "description": "Qwen2.5 7B - Best quality/speed balance. ~4.5GB VRAM.",
-        "task": "text-generation",
-        "architecture": "AutoModelForCausalLM",
-        "dtype": "bfloat16",
-        "trust_remote_code": false,
-        "quantization": {
-            "enabled": true,
-            "prequantize": true,
-            "method": "bitsandbytes",
-            "bits": 4,
-            "category": "text_llm_medium",
-            "skip_modules": [
-                "lm_head"
-            ]
-        },
-        "system_prompt": "You are a knowledgeable assistant.",
-        "generation_defaults": {
-            "max_new_tokens": 768,
-            "do_sample": true,
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "repetition_penalty": 1.05
-        },
-        "stop_strings": [
-            "<|endoftext|>"
-        ]
-    },
-    "unsloth/Qwen3-4B-unsloth-bnb-4bit": {
-        "description": "Qwen3 4B - Pre-quantized by Unsloth. Ready to use.",
-        "task": "text-generation",
-        "architecture": "AutoModelForCausalLM",
-        "dtype": "bfloat16",
-        "trust_remote_code": false,
-        "quantization": {
-            "enabled": false,
-            "notes": "Pre-quantized"
-        },
-        "system_prompt": "You are a helpful assistant.",
-        "generation_defaults": {
-            "max_new_tokens": 768,
-            "do_sample": true,
-            "temperature": 0.7,
-            "top_p": 0.9
-        }
-    },
-    "unsloth/Qwen3-VL-2B-Instruct-unsloth-bnb-4bit": {
-        "description": "Qwen3-VL 2B - Pre-quantized vision model.",
-        "task": "image-to-text",
-        "architecture": "AutoModelForImageTextToText",
-        "dtype": "bfloat16",
-        "trust_remote_code": true,
-        "quantization": {
-            "enabled": false,
-            "notes": "Pre-quantized"
-        },
-        "image_processing": {
-            "min_pixels": 200704,
-            "optimal_pixels": 501760,
-            "max_pixels": 702464
-        },
-        "parameters": {
-            "device_map": "auto",
-            "use_qwen_vision_utils": true
-        },
-        "system_prompt": "You are a helpful vision assistant.",
-        "default_prompt": "Describe this image.",
-        "generation_defaults": {
-            "max_new_tokens": 512,
-            "do_sample": false,
-            "repetition_penalty": 1.1
-        }
-    },
-    "unsloth/Qwen2.5-VL-3B-Instruct-unsloth-bnb-4bit": {
-        "description": "Qwen2.5-VL 3B - Pre-quantized. Good balance.",
-        "task": "image-to-text",
-        "architecture": "AutoModelForImageTextToText",
-        "dtype": "bfloat16",
-        "trust_remote_code": true,
-        "quantization": {
-            "enabled": false,
-            "notes": "Pre-quantized"
-        },
-        "image_processing": {
-            "min_pixels": 200704,
-            "optimal_pixels": 602112,
-            "max_pixels": 802816
-        },
-        "parameters": {
-            "device_map": "auto",
-            "use_qwen_vision_utils": true
-        },
-        "system_prompt": "You are a helpful vision assistant.",
-        "default_prompt": "Describe this image.",
-        "generation_defaults": {
-            "max_new_tokens": 768,
-            "do_sample": false,
-            "repetition_penalty": 1.1
-        }
-    },
-    "unsloth/Qwen3-Next-80B-A3B-Instruct-bnb-4bit": {
-        "description": "Qwen3-Next 80B MoE (3B active). Pre-quantized. ~6GB VRAM.",
-        "task": "text-generation",
-        "architecture": "AutoModelForCausalLM",
-        "dtype": "bfloat16",
-        "trust_remote_code": true,
-        "quantization": {
-            "enabled": false,
-            "notes": "Pre-quantized MoE"
-        },
-        "parameters": {
-            "device_map": "auto"
-        },
-        "system_prompt": "You are Qwen, a highly capable AI assistant.",
-        "generation_defaults": {
-            "max_new_tokens": 2048,
-            "do_sample": true,
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "repetition_penalty": 1.05
-        },
-        "stop_strings": [
-            "<|endoftext|>",
-            "<|im_end|>"
-        ]
-    },
-    "unsloth/Llama-3.3-70B-Instruct-bnb-4bit": {
-        "description": "Llama 3.3 70B - Meta's best open model. Pre-quantized. ~40GB VRAM.",
-        "task": "text-generation",
-        "architecture": "AutoModelForCausalLM",
-        "dtype": "bfloat16",
-        "trust_remote_code": false,
-        "quantization": {
-            "enabled": false,
-            "notes": "Pre-quantized"
-        },
-        "parameters": {
-            "device_map": "auto"
-        },
-        "system_prompt": "You are a helpful, harmless, and honest AI assistant.",
-        "generation_defaults": {
-            "max_new_tokens": 2048,
-            "do_sample": true,
-            "temperature": 0.6,
-            "top_p": 0.9,
-            "repetition_penalty": 1.1
-        },
-        "stop_strings": [
-            "<|eot_id|>",
-            "<|end_of_text|>"
-        ]
-    },
-    "unsloth/Llama-3.1-Nemotron-Nano-4B-v1.1-bnb-4bit": {
-        "description": "Nemotron Nano 4B - NVIDIA's efficient model. ~3GB VRAM.",
-        "task": "text-generation",
-        "architecture": "AutoModelForCausalLM",
-        "dtype": "bfloat16",
-        "trust_remote_code": false,
-        "quantization": {
-            "enabled": false,
-            "notes": "Pre-quantized"
-        },
-        "parameters": {
-            "device_map": "auto"
-        },
-        "system_prompt": "You are a helpful AI assistant created by NVIDIA.",
-        "generation_defaults": {
-            "max_new_tokens": 1024,
-            "do_sample": true,
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "repetition_penalty": 1.1
-        },
-        "stop_strings": [
-            "<|eot_id|>",
-            "<|end_of_text|>"
-        ]
-    },
-    "unsloth/Llama-3.1-Nemotron-70B-Instruct-bnb-4bit": {
-        "description": "Nemotron 70B - NVIDIA's flagship. Pre-quantized. ~40GB VRAM.",
-        "task": "text-generation",
-        "architecture": "AutoModelForCausalLM",
-        "dtype": "bfloat16",
-        "trust_remote_code": false,
-        "quantization": {
-            "enabled": false,
-            "notes": "Pre-quantized"
-        },
-        "parameters": {
-            "device_map": "auto"
-        },
-        "system_prompt": "You are a highly capable AI assistant.",
-        "generation_defaults": {
-            "max_new_tokens": 2048,
-            "do_sample": true,
-            "temperature": 0.6,
-            "top_p": 0.9,
-            "repetition_penalty": 1.05
-        },
-        "stop_strings": [
-            "<|eot_id|>",
-            "<|end_of_text|>"
-        ]
+        "backend": "transformers"
     },
     "BAAI/bge-reranker-v2-m3": {
-        "description": "Cross-encoder reranker (returns relevance score).",
+        "description": "Reranker (Transformers backend).",
         "task": "feature-extraction",
-        "architecture": "AutoModelForSequenceClassification",
-        "dtype": "float16",
-        "trust_remote_code": false,
-        "quantization": { "enabled": false },
-        "parameters": { "pair_sep": "\u241E" }
-        }
+        "backend": "transformers"
+    }
 }

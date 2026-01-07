@@ -1,1387 +1,653 @@
 """
-Cudara - CUDA Inference Server
-==============================
-Ollama-compatible API for HuggingFace models.
+Cudara Inference Server.
+========================
+
+A lightweight, CUDA-accelerated inference server designed for Linux/NVIDIA environments.
+It provides an Ollama-compatible API for GGUF (via llama.cpp) and Transformers models.
+
+Key Features:
+- STRICT Single-Model Concurrency: Only one model is loaded on the GPU at a time.
+- Sequential Processing: Requests are serialized via an async lock.
+- Automatic Cleanup: Models unload after 5 minutes of inactivity to free VRAM.
 """
 
+import asyncio
 import base64
+import datetime
+import fnmatch
 import gc
 import json
 import logging
 import os
-import re
 import shutil
-import sys
 import threading
 import time
-import warnings
-from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
+# Backends
 import torch
-import transformers
+
+# FastAPI & Tools
 from fastapi import BackgroundTasks, FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
-from huggingface_hub import login, snapshot_download
-from PIL import Image
-from pydantic import BaseModel, Field
-from transformers import (
-    AutoModel,
-    BitsAndBytesConfig,
-    pipeline,
-)
+from fastapi.responses import JSONResponse
+from huggingface_hub import hf_hub_download, list_repo_files, login, snapshot_download
+from pydantic import BaseModel
+from transformers import AutoModel, AutoTokenizer, pipeline
 
-# Internal imports
-from src.cudara.quantization import (
-    ModelQuantizer,
-    ensure_video_preprocessor_json,
-    load_processor_with_fallback,
-    sync_token_ids_with_tokenizer,
-)
+# GGUF Backend (Soft Import)
+Llama = None
+Llava15ChatHandler = None
 
-# Suppress noisy warnings
-warnings.filterwarnings("ignore", message=".*num_logits_to_keep.*", category=FutureWarning)
-warnings.filterwarnings("ignore", message=".*flash attention.*")
-warnings.filterwarnings("ignore", message=".*return_token_timestamps.*")
-warnings.filterwarnings("ignore", message=".*forced_decoder_ids.*")
+try:
+    from llama_cpp import Llama
 
-
-@contextmanager
-def suppress_output(suppress: bool = True):
-    """
-    Context manager to suppress stdout/stderr for noisy libraries.
-
-    Parameters
-    ----------
-    suppress : bool
-        If False, does nothing.
-    """
-    if not suppress:
-        yield
-        return
-
-    class Filter:
-        def __init__(self, stream, patterns):
-            self.stream = stream
-            self.patterns = patterns
-            self._skip = False
-
-        def write(self, text):
-            if any(p in text.lower() for p in self.patterns):
-                self._skip = True
-                return
-            if self._skip and text in ("\n", "\r\n", "\r"):
-                self._skip = False
-                return
-            self._skip = False
-            self.stream.write(text)
-
-        def flush(self):
-            self.stream.flush()
-
-    patterns = [
-        "flash attention",
-        "gptq",
-        "exllama",
-        "bitsandbytes",
-        "compiling",
-        "loading checkpoint",
-    ]
-    old_stdout, old_stderr = sys.stdout, sys.stderr
-    sys.stdout = Filter(old_stdout, patterns)
-    sys.stderr = Filter(old_stderr, patterns)
     try:
-        yield
-    finally:
-        sys.stdout, sys.stderr = old_stdout, old_stderr
-
-
-# =============================================================================
-# LOGGING
-# =============================================================================
-class ConciseFormatter(logging.Formatter):
-    """Custom log formatter for cleaner console output."""
-
-    FORMATS = {
-        logging.DEBUG: "\033[90m%(message)s\033[0m",
-        logging.INFO: "%(message)s",
-        logging.WARNING: "\033[33m⚠ %(message)s\033[0m",
-        logging.ERROR: "\033[31m✗ %(message)s\033[0m",
-        logging.CRITICAL: "\033[31;1m✗ %(message)s\033[0m",
-    }
-
-    def format(self, record):
-        fmt = self.FORMATS.get(record.levelno, "%(message)s")
-        return logging.Formatter(fmt).format(record)
-
-
-def setup_logging():
-    """Configure root logger with concise formatter."""
-    handler = logging.StreamHandler()
-    handler.setFormatter(ConciseFormatter())
-    root = logging.getLogger()
-    root.handlers = [handler]
-    root.setLevel(logging.INFO)
-    for lib in ["transformers", "huggingface_hub", "urllib3", "httpx"]:
-        logging.getLogger(lib).setLevel(logging.WARNING)
-    return logging.getLogger("cudara")
-
-
-logger = setup_logging()
+        from llama_cpp.llama_chat_format import Llava15ChatHandler
+    except ImportError:
+        pass
+except ImportError:
+    pass
 
 # =============================================================================
-# CONFIG
+# CONFIGURATION
 # =============================================================================
-PAIR_SEP_DEFAULT = "\u241e"
-HF_TOKEN: Optional[str] = os.getenv("HF_TOKEN")
-MODELS_DIR: Path = Path("models")
-REGISTRY_FILE: Path = Path("registry.json")
-ALLOWED_MODELS_FILE: Path = Path("models.json")
-TEMP_DIR: Path = Path("temp_uploads")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("cudara")
+
+# Optimize for NVIDIA Ampere+
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+HF_TOKEN = os.getenv("HF_TOKEN")
+if HF_TOKEN:
+    login(token=HF_TOKEN, add_to_git_credential=False)
+
+MODELS_DIR = Path("models")
+REGISTRY_FILE = Path("registry.json")
+ALLOWED_MODELS_FILE = Path("models.json")
+TEMP_DIR = Path("temp_uploads")
 
 MODELS_DIR.mkdir(exist_ok=True)
 TEMP_DIR.mkdir(exist_ok=True)
 
-if HF_TOKEN:
-    login(token=HF_TOKEN, add_to_git_credential=False)
-
-if torch.cuda.is_available():
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-
-QWEN_VL_TEMPLATE = (
-    "{% set image_count = namespace(value=0) %}{% set video_count = namespace(value=0) %}"
-    "{% for message in messages %}"
-    "{% if loop.first and messages[0]['role'] != 'system' %}<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n{% endif %}"
-    "<|im_start|>{{ message['role'] }}\n"
-    "{% if message['content'] is string %}{{ message['content'] }}<|im_end|>\n"
-    "{% else %}{% for content in message['content'] %}"
-    "{% if content['type'] == 'image' %}<|vision_start|><|image_pad|><|vision_end|>{% set image_count.value = image_count.value + 1 %}"
-    "{% elif content['type'] == 'video' %}<|vision_start|><|video_pad|><|vision_end|>{% set video_count.value = video_count.value + 1 %}"
-    "{% elif content['type'] == 'text' %}{{ content['text'] }}{% endif %}"
-    "{% endfor %}<|im_end|>\n{% endif %}{% endfor %}"
-    "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
-)
-
-
-# =============================================================================
-# ERROR HANDLING
-# =============================================================================
-class AppError(Exception):
-    """
-    Standard application exception.
-
-    Attributes
-    ----------
-    message : str
-        Error description.
-    status_code : int
-        HTTP status code.
-    details : dict
-        Additional error context (code, etc).
-    """
-
-    def __init__(self, message: str, status_code: int = 500, details: dict = None):
-        self.message = message
-        self.status_code = status_code
-        self.details = details or {}
-        super().__init__(message)
-
-
-class ErrorCode:
-    """Standard error codes for API responses."""
-
-    MODEL_NOT_FOUND = "model_not_found"
-    MODEL_NOT_READY = "model_not_ready"
-    MODEL_NOT_ALLOWED = "model_not_allowed"
-    INFERENCE_ERROR = "inference_error"
-    INVALID_REQUEST = "invalid_request"
-    BACKEND_ERROR = "backend_error"
-
-
-def error_response(code: str, message: str, **kwargs) -> dict:
-    """Format standard error response dict."""
-    return {"error": {"code": code, "message": message, **kwargs}}
+# Global Lock
+GPU_LOCK = asyncio.Lock()
+IDLE_TIMEOUT_SECONDS = 300  # 5 minutes
 
 
 # =============================================================================
 # DATA MODELS
 # =============================================================================
-class ModelStatus(str, Enum):
-    """Model lifecycle states."""
+class AppError(Exception):
+    def __init__(self, message: str, status_code: int = 500, code: str = "error"):
+        self.message = message
+        self.status_code = status_code
+        self.code = code
 
+
+class ModelStatus(str, Enum):
     DOWNLOADING = "downloading"
-    QUANTIZING = "quantizing"
     READY = "ready"
     ERROR = "error"
 
 
-class QuantizationConfig(BaseModel):
-    """Configuration for model quantization."""
-
-    enabled: bool = False
-    prequantize: bool = False
-    method: str = "bitsandbytes"
-    bits: int = 4
-    category: str = "text_llm_medium"
-    skip_modules: Optional[List[str]] = None
-
-
-class ImageProcessingCfg(BaseModel):
-    """Configuration for image preprocessing."""
-
-    min_pixels: int = 200704
-    optimal_pixels: int = 602112
-    max_pixels: int = 802816
-    max_retry_attempts: int = 3
-
-
-class InferenceOptimization(BaseModel):
-    """Runtime optimization flags."""
-
-    compile_model: bool = False
-    compile_mode: str = "reduce-overhead"
-    use_static_cache: bool = True
-
-
 class ModelConfig(BaseModel):
-    """
-    Configuration definition for an allowed model.
-
-    Attributes
-    ----------
-    task : str
-        HF task identifier (text-generation, etc).
-    backend : str
-        'transformers'.
-    architecture : str
-        Model class to load.
-    quantization : QuantizationConfig
-        Quantization settings.
-    """
-
     description: Optional[str] = None
-    task: str = "feature-extraction"
-    backend: Literal["transformers"] = "transformers"
-    architecture: str = "AutoModel"
-    dtype: str = "auto"
-    trust_remote_code: bool = False
-    quantization: Optional[QuantizationConfig] = None
-    parameters: Optional[Dict[str, Any]] = {}
-    generation_defaults: Optional[Dict[str, Any]] = {}
-    default_prompt: Optional[str] = None
+    task: str = "text-generation"
+    backend: str = "llama-cpp"
+    filename: Optional[str] = None
+    projector_filename: Optional[str] = None
     system_prompt: Optional[str] = None
-    stop_strings: Optional[List[str]] = None
-    inference_optimization: Optional[InferenceOptimization] = None
-    image_processing: Optional[ImageProcessingCfg] = None
+    generation_defaults: Dict[str, Any] = {}
 
 
 class RegistryItem(BaseModel):
-    """Runtime state of a downloaded model."""
-
     status: ModelStatus
     local_path: Optional[str] = None
+    projector_path: Optional[str] = None
     error_message: Optional[str] = None
-    is_prequantized: Optional[bool] = False
-    backend: Optional[str] = "transformers"
+    details: Dict[str, Any] = {}
+
+
+class ModelIdentifier(BaseModel):
+    name: str
+
+
+class PullRequest(BaseModel):
+    name: str
+    stream: bool = False
 
 
 class GenerateRequest(BaseModel):
-    """Request schema for /api/generate."""
-
     model: str
     prompt: str
     system: Optional[str] = None
     images: Optional[List[str]] = None
     stream: bool = False
-    options: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    options: Dict[str, Any] = {}
 
 
 class ChatMessage(BaseModel):
-    """Single message in chat history."""
-
     role: str
     content: str
     images: Optional[List[str]] = None
 
 
 class ChatRequest(BaseModel):
-    """Request schema for /api/chat."""
-
     model: str
     messages: List[ChatMessage]
     stream: bool = False
-    options: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    options: Dict[str, Any] = {}
 
 
 class EmbeddingRequest(BaseModel):
-    """Request schema for /api/embeddings."""
-
     model: str
     input: Union[str, List[str]]
-    options: Optional[Dict[str, Any]] = Field(default_factory=dict)
-
-
-class PullRequest(BaseModel):
-    """Request schema for /api/pull."""
-
-    name: str
-    stream: bool = False
-
-
-class ModelIdentifier(BaseModel):
-    """Simple model for endpoints requiring just a name."""
-
-    name: str = Field(..., description="The model identifier (e.g., 'Qwen/Qwen2.5-3B')")
+    options: Dict[str, Any] = {}
 
 
 # =============================================================================
 # MODEL MANAGER
 # =============================================================================
 class ModelManager:
-    """
-    Manages model configuration, downloading, and registry state.
-
-    Attributes
-    ----------
-    quantizer : ModelQuantizer
-        Helper for handling quantization during download.
-    """
-
-    def __init__(self):
+    def __init__(self) -> None:
         self._lock = threading.Lock()
-        self.quantizer = ModelQuantizer(MODELS_DIR)
-        self._init_files()
-
-    def _init_files(self):
-        """Ensure necessary JSON config files exist."""
         if not REGISTRY_FILE.exists():
             self._save_json(REGISTRY_FILE, {})
         if not ALLOWED_MODELS_FILE.exists():
             self._save_json(ALLOWED_MODELS_FILE, {})
 
+    def _save_json(self, path: Path, data: Any) -> None:
+        with self._lock:
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2)
+
     def _load_json(self, path: Path) -> Dict[str, Any]:
-        """Thread-safe JSON load."""
         with self._lock:
             if not path.exists():
                 return {}
             try:
-                with open(path, "r", encoding="utf-8") as f:
+                with open(path, "r") as f:
                     return json.load(f)
-            except Exception:
+            except json.JSONDecodeError:
                 return {}
 
-    def _save_json(self, path: Path, data: Dict[str, Any]):
-        """Thread-safe JSON save."""
-        with self._lock:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-
-    def get_allowed_models(self) -> Dict[str, ModelConfig]:
-        """
-        Get list of models configured in models.json.
-
-        Returns
-        -------
-        Dict[str, ModelConfig]
-            Map of model_id to configuration.
-        """
+    def get_allowed(self) -> Dict[str, ModelConfig]:
         data = self._load_json(ALLOWED_MODELS_FILE)
-        results = {}
-        for k, v in data.items():
-            if k.startswith("_"):
-                continue
-            if "quantization" in v:
-                v["quantization"] = QuantizationConfig(**v["quantization"])
-            if "inference_optimization" in v:
-                v["inference_optimization"] = InferenceOptimization(**v["inference_optimization"])
-            if "image_processing" in v:
-                v["image_processing"] = ImageProcessingCfg(**v["image_processing"])
-            results[k] = ModelConfig(**v)
-        return results
+        return {k: ModelConfig(**v) for k, v in data.items() if not k.startswith("_")}
 
     def get_registry(self) -> Dict[str, RegistryItem]:
-        """
-        Get runtime status of all models.
-
-        Returns
-        -------
-        Dict[str, RegistryItem]
-            Map of model_id to download/status state.
-        """
         data = self._load_json(REGISTRY_FILE)
         return {k: RegistryItem(**v) for k, v in data.items()}
 
-    def update_registry(
-        self,
-        model_id: str,
-        status: ModelStatus,
-        path: str = None,
-        error: str = None,
-        is_prequantized: bool = False,
-        backend: str = "transformers",
-    ):
-        """Update the registry entry for a model."""
-        raw = self._load_json(REGISTRY_FILE)
-        entry = raw.get(model_id, {})
-        entry.update(
-            {"status": status.value, "is_prequantized": is_prequantized, "backend": backend}
-        )
-        if path:
-            entry["local_path"] = path
-        if error:
-            entry["error_message"] = error
-        raw[model_id] = entry
-        self._save_json(REGISTRY_FILE, raw)
-
-    def get_model_path(self, model_id: str) -> Optional[Path]:
-        """Get local filesystem path if model is READY."""
-        reg = self.get_registry()
-        if model_id in reg and reg[model_id].status == ModelStatus.READY:
-            return Path(reg[model_id].local_path)
-        return None
-
-    def is_prequantized(self, model_id: str) -> bool:
-        """Check if model was pre-quantized during download."""
-        reg = self.get_registry()
-        return reg[model_id].is_prequantized if model_id in reg else False
-
-    def download_model_task(self, model_id: str):
-        """
-        Background task to download and optionally quantize a model.
-
-        Parameters
-        ----------
-        model_id : str
-            ID of the model to download.
-        """
-        config = self.get_allowed_models().get(model_id)
-        if not config:
-            return
-
-        target_dir = MODELS_DIR / model_id.replace("/", "--").replace(".", "_")
-        target_dir.mkdir(parents=True, exist_ok=True)
-        temp_dir = target_dir.parent / f"{target_dir.name}_temp"
-
-        try:
-            logger.info(f"Downloading {model_id}...")
-            should_quantize = (
-                config.quantization
-                and config.quantization.enabled
-                and config.quantization.prequantize
-            )
-            dest = temp_dir if should_quantize else target_dir
-            snapshot_download(repo_id=model_id, local_dir=dest, token=HF_TOKEN)
-
-            if should_quantize:
-                logger.info(f"Quantizing {model_id}...")
-                self.update_registry(model_id, ModelStatus.QUANTIZING)
-                res = self.quantizer.prequantize_model(
-                    model_id,
-                    temp_dir,
-                    target_dir,
-                    task=config.task,
-                    trust_remote_code=config.trust_remote_code,
-                    architecture=config.architecture,
-                )
-                self.update_registry(
-                    model_id,
-                    ModelStatus.READY,
-                    str(target_dir),
-                    is_prequantized=res.get("quantized", False),
-                )
-            else:
-                self.update_registry(model_id, ModelStatus.READY, str(target_dir))
-
-            logger.info(f"✓ {model_id} ready")
-
-        except Exception as e:
-            logger.error(f"Download failed: {e}")
-            if target_dir.exists():
-                shutil.rmtree(target_dir, ignore_errors=True)
-            self.update_registry(model_id, ModelStatus.ERROR, error=str(e))
-        finally:
-            if temp_dir.exists():
-                shutil.rmtree(temp_dir, ignore_errors=True)
-
-    def delete_model(self, model_id: str):
-        """Delete model files and registry entry."""
-        path = self.get_model_path(model_id)
-        if path and path.exists():
-            if path.is_file():
-                path.unlink()
-            else:
-                shutil.rmtree(path)
-
+    def update_registry(self, model_id: str, **kwargs: Any) -> None:
         reg = self._load_json(REGISTRY_FILE)
-        if model_id in reg:
-            del reg[model_id]
-            self._save_json(REGISTRY_FILE, reg)
+        entry = reg.get(model_id, {})
+        entry.update(kwargs)
+        reg[model_id] = entry
+        self._save_json(REGISTRY_FILE, reg)
 
-    def get_model_info(self, model_id: str) -> Optional[dict]:
-        """Construct detailed info for `show` command."""
-        config = self.get_allowed_models().get(model_id)
-        registry = self.get_registry().get(model_id)
+    def get_model_info(self, model_id: str) -> Optional[Dict[str, Any]]:
+        config = self.get_allowed().get(model_id)
+        reg = self.get_registry().get(model_id)
         if not config:
             return None
         return {
-            "modelfile": f"# {model_id}\n# {config.description or ''}",
-            "parameters": json.dumps(config.generation_defaults or {}, indent=2),
+            "modelfile": f"# {model_id}\n# {config.description}",
+            "parameters": json.dumps(config.generation_defaults),
             "template": config.system_prompt or "",
             "details": {
-                "format": config.backend,
-                "family": config.architecture,
-                "quantization_level": f"{config.quantization.bits}bit"
-                if config.quantization
-                else "none",
+                "format": "gguf" if config.backend != "transformers" else "transformers",
+                "family": config.task,
+                "quantization_level": reg.details.get("quantization", "unknown")
+                if reg
+                else "unknown",
             },
-            "model_info": {
-                "task": config.task,
-                "status": registry.status.value if registry else "not_downloaded",
-            },
+            "model_info": config.model_dump(),
         }
+
+    def download_task(self, model_id: str) -> None:
+        config = self.get_allowed().get(model_id)
+        if not config:
+            return
+
+        try:
+            logger.info(f"⬇️ Starting download: {model_id}")
+            if config.backend == "transformers" or config.task in [
+                "automatic-speech-recognition",
+                "feature-extraction",
+            ]:
+                local_dir = MODELS_DIR / model_id.replace("/", "--")
+                snapshot_download(repo_id=model_id, local_dir=local_dir)
+                self.update_registry(model_id, status=ModelStatus.READY, local_path=str(local_dir))
+            else:
+                if not config.filename:
+                    raise ValueError("GGUF models must specify 'filename'")
+                files = list_repo_files(repo_id=model_id)
+                matches = fnmatch.filter(files, config.filename)
+                if not matches:
+                    raise FileNotFoundError(f"No file matching {config.filename}")
+                target_file = matches[0]
+
+                path = hf_hub_download(repo_id=model_id, filename=target_file, local_dir=MODELS_DIR)
+
+                proj_path = None
+                if config.projector_filename:
+                    p_matches = fnmatch.filter(files, config.projector_filename)
+                    if p_matches:
+                        proj_path = hf_hub_download(
+                            repo_id=model_id, filename=p_matches[0], local_dir=MODELS_DIR
+                        )
+
+                quant = target_file.split(".")[-2] if "Q" in target_file else "unknown"
+                self.update_registry(
+                    model_id,
+                    status=ModelStatus.READY,
+                    local_path=path,
+                    projector_path=proj_path,
+                    details={"quantization": quant},
+                )
+
+            logger.info(f"✅ Download complete: {model_id}")
+
+        except Exception as e:
+            logger.error(f"❌ Download failed: {e}")
+            self.update_registry(model_id, status=ModelStatus.ERROR, error_message=str(e))
+
+    def delete_model(self, model_id: str) -> None:
+        reg = self.get_registry().get(model_id)
+        if reg and reg.local_path:
+            p = Path(reg.local_path)
+            if p.is_file():
+                p.unlink(missing_ok=True)
+            elif p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            if reg.projector_path:
+                Path(reg.projector_path).unlink(missing_ok=True)
+
+        full_reg = self._load_json(REGISTRY_FILE)
+        if model_id in full_reg:
+            del full_reg[model_id]
+            self._save_json(REGISTRY_FILE, full_reg)
 
 
 # =============================================================================
 # INFERENCE ENGINE
 # =============================================================================
 class InferenceEngine:
-    """
-    Handles model loading, unloading, and inference execution.
-
-    Features:
-    - Lazy loading
-    - Automatic unloading on idle (300s)
-    - Supports Transformers
-    - Vision support
-    - **Concurrency Safety**: Strict locking for GPU operations.
-    """
-
-    def __init__(self, manager: ModelManager):
+    def __init__(self, manager: ModelManager) -> None:
         self.manager = manager
-        self.active_pipeline: Any = None
-        self.active_model_id = None
-        self.active_config: Optional[ModelConfig] = None
-        self.active_dtype: Optional[torch.dtype] = None
-        self.last_access = 0.0
+        self.active_id: Optional[str] = None
+        self.model_instance: Any = None
+        self._lock = threading.Lock()
+        self.last_interaction: float = 0.0
 
-        # _lock protects internal state changes (loading/unloading)
-        self._lock = threading.RLock()
-        # _inference_lock forces strictly sequential execution of inference
-        # This prevents model swapping during a generation request and ensures single-user GPU access.
-        self._inference_lock = threading.Lock()
+    def touch(self) -> None:
+        """Update the last interaction timestamp to prevent idle cleanup."""
+        self.last_interaction = time.time()
 
-        threading.Thread(target=self._idle_monitor, daemon=True).start()
+    def _unload(self) -> None:
+        if self.model_instance:
+            logger.info(f"♻️ Unloading {self.active_id}...")
+            del self.model_instance
+            self.model_instance = None
+            self.active_id = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
 
-    def _idle_monitor(self):
-        """Background thread to unload models after inactivity."""
-        while True:
-            time.sleep(60)
-            # We use _lock here to check state, but we don't need _inference_lock
-            # just to check time. We only lock if we decide to unload.
-            with self._lock:
-                if self.active_pipeline and (time.time() - self.last_access > 300):
-                    # Ensure no inference is running before unloading
-                    if self._inference_lock.acquire(blocking=False):
-                        try:
-                            self._unload()
-                        finally:
-                            self._inference_lock.release()
-                    else:
-                        logger.info("Skipping idle unload: inference in progress")
+    def load(self, model_id: str) -> None:
+        # Implicitly touch when checking/loading
+        self.touch()
 
-    def _unload(self):
-        """Unload current model and free VRAM."""
-        self.active_pipeline = None
-        self.active_model_id = None
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        logger.info("Model unloaded (idle)")
-
-    def _clean_reasoning(self, text: str) -> str:
-        """Strip reasoning/thought chains from output if present."""
-        if not text:
-            return ""
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-        text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
-        return text.strip()
-
-    def load_model(self, model_id: str):
-        """
-        Load a model into memory if not already active.
-        This method is protected by self._lock via the caller (inference methods).
-
-        Parameters
-        ----------
-        model_id : str
-            Model to load.
-        """
-        # Note: We don't acquire _lock here explicitly because this function is
-        # called inside the _inference_lock block of the public methods.
-        # The _inference_lock implies exclusive access to the GPU.
-
-        if self.active_model_id == model_id:
+        if self.active_id == model_id:
             return
 
-        config = self.manager.get_allowed_models().get(model_id)
-        if not config:
-            raise AppError(
-                f"Model '{model_id}' not configured", 404, {"code": ErrorCode.MODEL_NOT_ALLOWED}
-            )
+        config = self.manager.get_allowed().get(model_id)
+        reg = self.manager.get_registry().get(model_id)
 
-        path = self.manager.get_model_path(model_id)
-        if not path:
-            raise AppError(
-                f"Model '{model_id}' not downloaded", 404, {"code": ErrorCode.MODEL_NOT_READY}
-            )
+        if not config or not reg or reg.status != ModelStatus.READY:
+            raise AppError(f"Model {model_id} not ready", 404, "model_not_ready")
 
-        if self.active_pipeline:
+        with self._lock:
+            if self.active_id == model_id:
+                return
             self._unload()
-        # Transformers Backend
-        ensure_video_preprocessor_json(path)
-        is_prequantized = self.manager.is_prequantized(model_id)
 
-        if config.dtype == "float32":
-            dtype = torch.float32
-        elif config.dtype == "float16":
-            dtype = torch.float16
-        elif config.dtype == "bfloat16":
-            dtype = torch.bfloat16
-        else:
-            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-
-        self.active_dtype = dtype
-        logger.info(f"Loading {model_id}...")
-
-        model_cls = getattr(transformers, config.architecture, AutoModel)
-        load_kwargs = {
-            "device_map": "auto",
-            "dtype": dtype,
-            "trust_remote_code": config.trust_remote_code,
-            "low_cpu_mem_usage": True,
-        }
-
-        if config.task != "automatic-speech-recognition":
-            try:
-                from transformers.utils import is_flash_attn_2_available
-
-                if is_flash_attn_2_available():
-                    load_kwargs["attn_implementation"] = "flash_attention_2"
-            except Exception:
-                pass
-
-        if not is_prequantized and config.quantization and config.quantization.enabled:
-            load_kwargs["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=(config.quantization.bits == 4),
-                load_in_8bit=(config.quantization.bits == 8),
-                bnb_4bit_compute_dtype=dtype,
-                bnb_4bit_quant_type="nf4",
-                llm_int8_skip_modules=config.quantization.skip_modules or ["lm_head"],
-            )
-
-        with suppress_output():
-            model = model_cls.from_pretrained(str(path), **load_kwargs)
-        model.eval()
-
-        processor = load_processor_with_fallback(path, config.trust_remote_code)
-        is_vlm = config.task == "image-to-text" or "vl" in model_id.lower()
-        tokenizer_ref = getattr(processor, "tokenizer", processor)
-
-        if is_vlm:
-            tokenizer_ref.chat_template = QWEN_VL_TEMPLATE
-            if hasattr(processor, "chat_template"):
-                processor.chat_template = QWEN_VL_TEMPLATE
-            sync_token_ids_with_tokenizer(model, processor)
-        else:
-            if not tokenizer_ref.pad_token:
-                tokenizer_ref.pad_token = tokenizer_ref.eos_token
-                model.config.pad_token_id = model.config.eos_token_id
-
-        if config.task == "automatic-speech-recognition":
-            self.active_pipeline = pipeline(
-                task=config.task,
-                model=model,
-                tokenizer=tokenizer_ref,
-                feature_extractor=getattr(processor, "feature_extractor", processor),
-                dtype=dtype,
-                device_map="auto",
-            )
-        else:
-            self.active_pipeline = (model, processor)
-
-        self.active_model_id = model_id
-        self.active_config = config
-        self.last_access = time.time()
-        logger.info(f"✓ {model_id} loaded")
-
-    def generate(
-        self,
-        model_id: str,
-        prompt: str,
-        images: List[str] = None,
-        system: str = None,
-        options: dict = None,
-    ) -> dict:
-        """
-        Execute text generation.
-        Strictly serialized to prevent concurrent GPU usage.
-        """
-        with self._inference_lock:
-            self.load_model(model_id)
+            logger.info(f"🚀 Loading {model_id} ({config.backend})...")
             start = time.perf_counter()
-            self.last_access = time.time()
-            options = options or {}
-            # Transformers
-            return self._generate_transformers(prompt, images, system, options, start)
 
-    def _generate_transformers(self, prompt, images, system, options, start):
-        config = self.active_config
-        model, processor = self.active_pipeline
-        tokenizer = getattr(processor, "tokenizer", processor)
-
-        messages = []
-        if system or config.system_prompt:
-            messages.append({"role": "system", "content": system or config.system_prompt})
-
-        content = []
-        image_obj = None
-
-        if images and config.task == "image-to-text":
-            import io
-
-            from src.cudara.image_processing import AdaptiveImageProcessor
-
-            img_data = base64.b64decode(images[0])
-            raw_img = Image.open(io.BytesIO(img_data)).convert("RGB")
-
-            model_usage = (
-                torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
-            )
-            img_proc = AdaptiveImageProcessor.from_gpu_info(model_usage)
-            if config.image_processing:
-                img_proc.config.min_pixels = config.image_processing.min_pixels
-                img_proc.config.optimal_pixels = config.image_processing.optimal_pixels
-
-            image_obj, _ = img_proc.prepare_for_inference(raw_img)
-            content.append({"type": "image", "image": image_obj})
-
-        if prompt:
-            content.append({"type": "text", "text": prompt})
-
-        messages.append({"role": "user", "content": content if image_obj else prompt})
-
-        try:
-            if config.parameters and config.parameters.get("use_qwen_vision_utils"):
-                text = processor.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-                inputs = processor(
-                    text=[text],
-                    images=[image_obj] if image_obj else None,
-                    padding=True,
-                    return_tensors="pt",
-                )
+            if config.backend == "transformers" or config.task in [
+                "automatic-speech-recognition",
+                "feature-extraction",
+            ]:
+                self._load_transformers(config, reg.local_path)
             else:
-                text = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-                if image_obj:
-                    inputs = processor(
-                        text=[text], images=[image_obj], padding=True, return_tensors="pt"
+                self._load_gguf(config, reg.local_path, reg.projector_path)
+
+            self.active_id = model_id
+            logger.info(f"✅ Loaded in {time.perf_counter() - start:.2f}s")
+
+    def _load_transformers(self, config: ModelConfig, path: str) -> None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if config.task == "automatic-speech-recognition":
+            self.model_instance = pipeline(
+                "automatic-speech-recognition",
+                model=path,
+                device=device,
+                torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            )
+        elif config.task == "feature-extraction":
+            tokenizer = AutoTokenizer.from_pretrained(path)
+            model = AutoModel.from_pretrained(path, trust_remote_code=True).to(device)
+            self.model_instance = (model, tokenizer)
+        else:
+            raise AppError(f"Task {config.task} not supported", 500)
+
+    def _load_gguf(self, config: ModelConfig, path: str, projector_path: Optional[str]) -> None:
+        if not Llama:
+            raise AppError("llama-cpp-python missing", 500)
+
+        params = config.generation_defaults.copy()
+        n_gpu = params.pop("n_gpu_layers", -1)
+        n_ctx = params.pop("n_ctx", 4096)
+
+        # Auto-detect context window if 0
+        if n_ctx == 0:
+            n_ctx = 0
+
+        chat_handler = None
+        if config.task == "image-to-text" and projector_path:
+            if Llava15ChatHandler:
+                chat_handler = Llava15ChatHandler(clip_model_path=projector_path)
+
+        self.model_instance = Llama(
+            model_path=path,
+            n_gpu_layers=n_gpu,
+            n_ctx=n_ctx,
+            chat_handler=chat_handler,
+            verbose=False,
+        )
+
+    # --- Methods (Updated to call self.touch()) ---
+
+    def chat(self, model_id: str, messages: List[Dict], options: Dict[str, Any]) -> Dict[str, Any]:
+        self.load(model_id)
+        if not isinstance(self.model_instance, Llama):
+            raise AppError("Chat supported only for GGUF", 400)
+
+        # Prepare messages
+        fmt_msgs = []
+        for m in messages:
+            if m.get("images"):
+                content = [{"type": "text", "text": m["content"]}]
+                for img in m["images"]:
+                    content.append(
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}}
                     )
-                else:
-                    inputs = tokenizer(text, return_tensors="pt")
-        except Exception as e:
-            logger.warning(f"Template failed: {e}")
-            inputs = tokenizer(prompt, return_tensors="pt")
+                fmt_msgs.append({"role": m["role"], "content": content})
+            else:
+                fmt_msgs.append({"role": m["role"], "content": m["content"]})
 
-        inputs = {k: v.to("cuda") for k, v in inputs.items()}
-        input_len = inputs["input_ids"].shape[1]
+        defaults = self.manager.get_allowed()[model_id].generation_defaults or {}
+        kwargs = {**defaults, **options}
+        for k in ["n_gpu_layers", "n_ctx", "n_batch"]:
+            kwargs.pop(k, None)
 
-        gen_kwargs = {**(config.generation_defaults or {}), **options}
-        gen_kwargs["use_cache"] = True
-        if "num_predict" in gen_kwargs:
-            gen_kwargs["max_new_tokens"] = gen_kwargs.pop("num_predict")
-
-        gen_start = time.perf_counter()
-        with torch.no_grad():
-            outputs = model.generate(**inputs, **gen_kwargs)
-        gen_time = time.perf_counter() - gen_start
-
-        new_tokens = outputs[0][input_len:]
-        result = self._clean_reasoning(tokenizer.decode(new_tokens, skip_special_tokens=True))
-
-        if config.stop_strings:
-            for s in config.stop_strings:
-                result = result.split(s)[0]
-
-        elapsed = time.perf_counter() - start
+        res = self.model_instance.create_chat_completion(messages=fmt_msgs, **kwargs)
+        duration = int(
+            (time.perf_counter() - self.last_interaction) * 1e9
+        )  # Approx since load calls touch
 
         return {
-            "model": self.active_model_id,
-            "created_at": datetime.now(timezone.utc).isoformat() + "Z",
-            "response": result.strip(),
+            "model": model_id,
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "message": res["choices"][0]["message"],
             "done": True,
-            "total_duration": int(elapsed * 1e9),
-            "eval_count": len(new_tokens),
-            "eval_duration": int(gen_time * 1e9),
+            "total_duration": duration,
+            "eval_count": res["usage"]["completion_tokens"],
         }
 
-    def chat(self, model_id: str, messages: List[ChatMessage], options: dict = None) -> dict:
-        """
-        Execute chat interaction.
-        Note: The actual locking happens in `self.generate` which this calls,
-        but we add it here too if we ever change implementation to avoid ambiguity.
-        Since `generate` locks, this is safe, but for clarity:
-        """
-        # We process messages here then call generate.
-        # generate() will acquire the lock.
-        last_msg = messages[-1]
-        system = next((m.content for m in messages if m.role == "system"), None)
-        return self.generate(model_id, last_msg.content, last_msg.images, system, options)
+    def embeddings(
+        self, model_id: str, texts: List[str], options: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        self.load(model_id)
+        start = time.perf_counter()
 
-    def embeddings(self, model_id: str, texts: List[str], options: dict = None) -> dict:
-        with self._inference_lock:
-            self.load_model(model_id)
-            config = self.active_config
-            start = time.perf_counter()
-            self.last_access = time.time()
+        if isinstance(self.model_instance, Llama):
+            raise AppError("Use transformers for embeddings", 400)
 
-            if config.task != "feature-extraction":
-                raise AppError(...)
+        model, tokenizer = self.model_instance
+        device = model.device
 
-            options = options or {}
+        sep = options.get("pair_sep", "\u241e")
+        if any(sep in t for t in texts):
+            pairs = [t.split(sep, 1) for t in texts]
+            inputs = tokenizer(
+                pairs, return_tensors="pt", padding=True, truncation=True, max_length=512
+            ).to(device)
+            with torch.no_grad():
+                scores = model(**inputs).logits.view(-1).float().cpu().tolist()
+            output = [[s] for s in scores]
+        else:
+            inputs = tokenizer(
+                texts, return_tensors="pt", padding=True, truncation=True, max_length=512
+            ).to(device)
+            with torch.no_grad():
+                output = model(**inputs).last_hidden_state.mean(dim=1).cpu().tolist()
 
-            # IMPORTANT: pipeline stores (model, processor), not guaranteed tokenizer
-            model, processor = self.active_pipeline
-            tokenizer = getattr(processor, "tokenizer", processor)
+        return {
+            "model": model_id,
+            "embeddings": output,
+            "total_duration": int((time.perf_counter() - start) * 1e9),
+        }
 
-            pair_sep = (
-                options.get("pair_sep")
-                or (config.parameters or {}).get("pair_sep")
-                or PAIR_SEP_DEFAULT
-            )
-            batch_size = int(options.get("batch_size", 16))
-            max_length = int(options.get("max_length", 512))
-
-            device = next(model.parameters()).device
-
-            all_embeddings = []
-
-            for i in range(0, len(texts), batch_size):
-                chunk = texts[i : i + batch_size]
-
-                # Split into (query, doc) if separator exists
-                qs, ds = [], []
-                is_paired = False
-                for t in chunk:
-                    if pair_sep in t:
-                        q, d = t.split(pair_sep, 1)
-                        qs.append(q.strip())
-                        ds.append(d.strip())
-                        is_paired = True
-                    else:
-                        qs.append("")
-                        ds.append(t.strip())
-
-                if is_paired:
-                    inputs = tokenizer(
-                        qs,
-                        ds,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=max_length,
-                    )
-                else:
-                    inputs = tokenizer(
-                        chunk,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=max_length,
-                    )
-
-                inputs = {k: v.to(device) for k, v in inputs.items()}
-
-                with torch.no_grad():
-                    out = model(**inputs)
-
-                # RERANKER PATH: SequenceClassification models return logits
-                if hasattr(out, "logits") and out.logits is not None:
-                    logits = out.logits
-                    if logits.ndim == 2 and logits.shape[1] >= 2:
-                        scores = logits[:, -1]  # positive-class logit (common)
-                    else:
-                        scores = logits.view(-1)  # [B,1] -> [B]
-                    scores = scores.float().cpu().tolist()
-                    all_embeddings.extend([[float(s)] for s in scores])
-                else:
-                    # EMBEDDING PATH
-                    hs = out.last_hidden_state
-                    embs = hs.mean(dim=1).float().cpu().tolist()
-                    all_embeddings.extend(embs)
-
-            return {
-                "model": model_id,
-                "embeddings": all_embeddings,
-                "total_duration": int((time.perf_counter() - start) * 1e9),
-            }
-
-    def transcribe(self, model_id: str, audio_path: str, options: dict = None) -> dict:
-        """
-        Transcribe audio file.
-        Strictly serialized.
-        """
-        with self._inference_lock:
-            self.load_model(model_id)
-            config = self.active_config
-            start = time.perf_counter()
-            self.last_access = time.time()
-
-            if config.task != "automatic-speech-recognition":
-                raise AppError(
-                    f"Model {model_id} is not an ASR model",
-                    400,
-                    {"code": ErrorCode.INVALID_REQUEST},
-                )
-
-            options = options or {}
-            merged = {**(config.generation_defaults or {}), **options}
-            pipeline_args = {
-                k: v
-                for k, v in merged.items()
-                if k in ["return_timestamps", "chunk_length_s", "stride_length_s"]
-            }
-            generate_kwargs = {k: v for k, v in merged.items() if k not in pipeline_args}
-            generate_kwargs.pop("return_token_timestamps", None)
-
-            try:
-                res = self.active_pipeline(
-                    audio_path, generate_kwargs=generate_kwargs, **pipeline_args
-                )
-                if isinstance(res, list):
-                    text = " ".join([c.get("text", "") for c in res])
-                elif isinstance(res, dict):
-                    text = res.get("text", "")
-                else:
-                    text = str(res)
-
-                return {
-                    "model": model_id,
-                    "text": text.strip(),
-                    "total_duration": int((time.perf_counter() - start) * 1e9),
-                }
-            except Exception as e:
-                raise AppError(
-                    f"Transcription failed: {e}", 500, {"code": ErrorCode.INFERENCE_ERROR}
-                )
+    def transcribe(self, model_id: str, file_path: str, options: Dict[str, Any]) -> Dict[str, Any]:
+        self.load(model_id)
+        start = time.perf_counter()
+        res = self.model_instance(file_path, **options)
+        return {
+            "model": model_id,
+            "text": res.get("text", "").strip(),
+            "total_duration": int((time.perf_counter() - start) * 1e9),
+        }
 
 
 # =============================================================================
-# STARTUP LOGIC & LIFESPAN
+# APP LIFECYCLE & MONITORING
 # =============================================================================
-
-manager = ModelManager()
-engine = InferenceEngine(manager)
-DEFAULT_MODELS_ENV = "CUDARA_DEFAULT_MODELS"
-
-
-def parse_default_models_env() -> Optional[List[str]]:
-    """
-    Parse the CUDARA_DEFAULT_MODELS environment variable.
-
-    Expected format: comma-separated model IDs (must exist in models.json).
-    Treats unset, empty, or "None" (case-insensitive) as disabled.
-    """
-    raw = os.getenv(DEFAULT_MODELS_ENV)
-    if raw is None:
-        return None
-    raw = raw.strip()
-    if raw == "" or raw.lower() == "none":
-        return None
-    models = [m.strip() for m in raw.split(",") if m.strip()]
-    return models or None
-
-
-def _download_default_models(models: List[str]):
-    """
-    Download default models sequentially in a background thread.
-    Health will remain unhealthy until all requested default models are READY.
-    """
-    for model_id in models:
+async def monitor_idle_models(engine_ref: InferenceEngine):
+    """Background task to unload models after inactivity."""
+    logger.info("🕒 Idle monitor started (Timeout: 5min)")
+    while True:
         try:
-            reg = manager.get_registry().get(model_id)
-            if reg and reg.status == ModelStatus.READY and not reg.error_message:
-                continue
-            manager.update_registry(model_id, ModelStatus.DOWNLOADING)
-            manager.download_model_task(model_id)
+            await asyncio.sleep(60)  # Check every minute
+            if engine_ref.active_id:
+                idle_time = time.time() - engine_ref.last_interaction
+                if idle_time > IDLE_TIMEOUT_SECONDS:
+                    logger.info(
+                        f"⏱️ Idle timeout ({idle_time:.0f}s > {IDLE_TIMEOUT_SECONDS}s). Unloading..."
+                    )
+                    async with GPU_LOCK:
+                        engine_ref._unload()
+        except asyncio.CancelledError:
+            break
         except Exception as e:
-            logger.error(f"Startup download failed for {model_id}: {e}")
+            logger.error(f"Monitor error: {e}")
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    Application lifespan handler.
-    Handles startup tasks (downloading default models) and shutdown cleanup.
-    """
-    # Startup Logic
-    requested = parse_default_models_env() or []
-    app.state.default_models_requested = requested
-    app.state.default_models_valid = []
-    app.state.default_models_invalid = []
-
-    if requested:
-        allowed = manager.get_allowed_models()
-        invalid = [m for m in requested if m not in allowed]
-        valid = [m for m in requested if m in allowed]
-
-        app.state.default_models_valid = valid
-        app.state.default_models_invalid = invalid
-
-        if invalid:
-            logger.error(
-                f"{DEFAULT_MODELS_ENV} contains unknown model IDs (not in models.json): {', '.join(invalid)}"
-            )
-
-        if valid:
-            threading.Thread(target=_download_default_models, args=(valid,), daemon=True).start()
-
-    yield  # Application runs here
-
-    # Shutdown Logic (Cleanup if needed)
-    pass
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    # Startup
+    monitor_task = asyncio.create_task(monitor_idle_models(engine))
+    yield
+    # Shutdown
+    monitor_task.cancel()
+    try:
+        await monitor_task
+    except asyncio.CancelledError:
+        pass
+    if engine.active_id:
+        engine._unload()
 
 
-# =============================================================================
-# API
-# =============================================================================
-
+manager = ModelManager()
+engine = InferenceEngine(manager)
 app = FastAPI(
-    title="Cudara",
-    description="""
-    **Lightweight CUDA inference server.** This API is compatible with the Ollama standard, allowing you to drop it in
-    as a replacement backend for existing tools.
-    """,
+    title="Cudara API",
     version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    contact={
-        "name": "Cudara Maintainer",
-        "url": "https://github.com/juliog922/cudara",
-    },
+    description="Sequential GPU Inference Server",
     lifespan=lifespan,
 )
 
 
 @app.exception_handler(AppError)
-async def app_error_handler(request: Request, exc: AppError):
+async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
     return JSONResponse(
-        status_code=exc.status_code,
-        content=error_response(exc.details.get("code", "error"), exc.message),
+        status_code=exc.status_code, content={"error": {"code": exc.code, "message": exc.message}}
     )
 
 
-@app.exception_handler(Exception)
-async def general_error_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled: {exc}")
-    return JSONResponse(status_code=500, content=error_response("internal_error", str(exc)))
+# --- Routes (Same as before) ---
 
 
-def _build_health_payload() -> tuple[int, Dict[str, Any]]:
-    """
-    Build a health payload and status code.
-
-    If CUDARA_DEFAULT_MODELS is set, the server reports unhealthy (HTTP 503)
-    until all requested models are READY with no errors.
-    """
-    requested = getattr(app.state, "default_models_requested", []) or []
-    invalid = getattr(app.state, "default_models_invalid", []) or []
-
-    registry = manager.get_registry()
-    default_status: Dict[str, Any] = {}
-
-    ready = True
-    if requested:
-        for model_id in requested:
-            if model_id in invalid:
-                default_status[model_id] = {
-                    "status": "invalid",
-                    "error": "Model ID not found in models.json",
-                }
-                ready = False
-                continue
-
-            reg = registry.get(model_id)
-            if not reg:
-                default_status[model_id] = {"status": "not_downloaded"}
-                ready = False
-                continue
-
-            default_status[model_id] = {
-                "status": reg.status.value,
-                "error": reg.error_message,
-            }
-            if reg.status != ModelStatus.READY or reg.error_message:
-                ready = False
-
-    status_code = 200 if ready else 503
-
-    payload: Dict[str, Any] = {
-        "status": "ok" if ready else "unhealthy",
-        "version": "1.0.0",
-        "active_model": engine.active_model_id,
+@app.get("/", tags=["Health"])
+@app.get("/health", tags=["Health"])
+def health() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "active_model": engine.active_id,
         "cuda_available": torch.cuda.is_available(),
         "vram_used": f"{torch.cuda.memory_allocated() / 1024**3:.1f}GB"
         if torch.cuda.is_available()
         else "0GB",
-        "default_models": requested,
-        "default_models_status": default_status,
-        "default_models_invalid": invalid,
     }
-    return status_code, payload
 
 
-@app.get("/", tags=["UI"], summary="Landing Page", response_class=HTMLResponse)
-async def landing_page(request: Request):
-    """
-    **Serves the UI.**
-
-    If the client accepts `text/html`, serves `index.html`.
-    Otherwise, falls back to the JSON health check.
-    """
-    landing_file = Path("index.html")
-    accept = (request.headers.get("accept") or "").lower()
-    if "text/html" in accept and landing_file.exists():
-        return HTMLResponse(content=landing_file.read_text(encoding="utf-8"))
-    status_code, payload = _build_health_payload()
-    return JSONResponse(content=payload, status_code=status_code)
-
-
-@app.get(
-    "/health",
-    tags=["Health"],
-    summary="Server Health",
-    response_description="Server status and VRAM usage",
-)
-def health():
-    """
-    **Health Check.**
-
-    Returns server status and VRAM usage.
-
-    If `CUDARA_DEFAULT_MODELS` is set, this endpoint reports HTTP 503 (unhealthy)
-    until all requested default models are downloaded and READY with no errors.
-    """
-    status_code, payload = _build_health_payload()
-    return JSONResponse(content=payload, status_code=status_code)
-
-
-@app.get("/api/tags", tags=["Models"], summary="List Models")
-def list_models():
-    """
-    **List Available Models.**
-
-    Returns a list of models configured in `models.json` and their local download status.
-    Compatible with Ollama's `/api/tags`.
-    """
-    allowed = manager.get_allowed_models()
-    registry = manager.get_registry()
-    models = []
-    for model_id, config in allowed.items():
-        reg = registry.get(model_id)
-        models.append(
+@app.get("/api/tags", tags=["Models"])
+def list_models() -> Dict[str, List[Dict]]:
+    allowed = manager.get_allowed()
+    reg = manager.get_registry()
+    models_list = []
+    for k, v in allowed.items():
+        r = reg.get(k)
+        models_list.append(
             {
-                "name": model_id,
-                "modified_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "size": 0,  # TODO: Calculate actual disk size
-                "details": {"format": config.backend, "family": config.architecture},
-                "status": reg.status.value if reg else "not_downloaded",
-                "description": config.description,
+                "name": k,
+                "status": r.status.value if r else "not_downloaded",
+                "details": r.details if r else {"format": "gguf"},
+                "description": v.description,
             }
         )
-    return {"models": models}
+    return {"models": models_list}
 
 
-@app.post("/api/show", tags=["Models"], summary="Model Details")
-def show_model(request: ModelIdentifier):
-    """
-    **Show Model Information.**
-
-    Returns details about a specific model, including its Modelfile parameters,
-    template, and quantization status.
-    """
-    model_id = request.name
-    info = manager.get_model_info(model_id)
+@app.post("/api/show", tags=["Models"])
+def show_model(req: ModelIdentifier) -> Dict[str, Any]:
+    info = manager.get_model_info(req.name)
     if not info:
-        raise AppError(f"Model '{model_id}' not found", 404, {"code": ErrorCode.MODEL_NOT_FOUND})
+        raise AppError("Model not found", 404, "model_not_found")
     return info
 
 
-@app.post("/api/pull", tags=["Models"], summary="Pull Model")
-def pull_model(request: PullRequest, bg: BackgroundTasks):
-    """
-    **Download/Pull a Model.**
-
-    Triggers a background task to download (and optionally quantize) the model
-    from HuggingFace.
-
-    - **name**: The model ID (must be in `models.json`).
-    """
-    if request.name not in manager.get_allowed_models():
-        raise AppError(
-            f"Model '{request.name}' not allowed", 403, {"code": ErrorCode.MODEL_NOT_ALLOWED}
-        )
-    manager.update_registry(request.name, ModelStatus.DOWNLOADING)
-    bg.add_task(manager.download_model_task, request.name)
+@app.post("/api/pull", tags=["Models"])
+def pull_model(req: PullRequest, bg: BackgroundTasks) -> Dict[str, str]:
+    if req.name not in manager.get_allowed():
+        raise AppError("Model not allowed", 403, "model_not_allowed")
+    manager.update_registry(req.name, status=ModelStatus.DOWNLOADING)
+    bg.add_task(manager.download_task, req.name)
     return {"status": "downloading"}
 
 
-@app.delete("/api/delete", tags=["Models"], summary="Delete Model")
-def delete_model(request: ModelIdentifier):
-    """
-    **Delete a Model.**
-
-    Removes the model files from disk and unloads it from VRAM if active.
-    """
-    model_id = request.name
-    if engine.active_model_id == model_id:
+@app.delete("/api/delete", tags=["Models"])
+def delete_model(req: ModelIdentifier) -> Dict[str, str]:
+    if engine.active_id == req.name:
         engine._unload()
-    manager.delete_model(model_id)
+    manager.delete_model(req.name)
     return {"status": "deleted"}
 
 
-@app.post("/api/generate", tags=["Inference"], summary="Generate Text")
-def generate(request: GenerateRequest):
-    """
-    **Text Generation.**
-
-    Standard completion endpoint.
-
-    - **model**: Model ID.
-    - **prompt**: Input text.
-    - **images**: List of base64 strings (for VLMs).
-    - **options**: Inference parameters (temperature, top_p, etc).
-    """
-    return engine.generate(
-        request.model, request.prompt, request.images, request.system, request.options
-    )
+@app.post("/api/generate", tags=["Inference"])
+async def generate(req: GenerateRequest) -> Dict[str, Any]:
+    async with GPU_LOCK:
+        msg = {"role": "user", "content": req.prompt}
+        if req.images:
+            msg["images"] = req.images
+        return engine.chat(req.model, [msg], req.options)
 
 
-@app.post("/api/chat", tags=["Inference"], summary="Chat Completion")
-def chat(request: ChatRequest):
-    """
-    **Chat Interface.**
-
-    Interactive chat completion compatible with OpenAI/Ollama formats.
-
-    - **messages**: List of message objects `{"role": "user", "content": "..."}`.
-    """
-    result = engine.chat(request.model, request.messages, request.options)
-    return {
-        "model": result["model"],
-        "created_at": result["created_at"],
-        "message": {"role": "assistant", "content": result["response"]},
-        "done": True,
-        "total_duration": result["total_duration"],
-        "eval_count": result.get("eval_count", 0),
-    }
+@app.post("/api/chat", tags=["Inference"])
+async def chat(req: ChatRequest) -> Dict[str, Any]:
+    async with GPU_LOCK:
+        return engine.chat(req.model, [m.model_dump() for m in req.messages], req.options)
 
 
-@app.post("/api/embeddings", tags=["Inference"], summary="Generate Embeddings")
+@app.post("/api/embeddings", tags=["Inference"])
 @app.post("/api/embed", tags=["Inference"], include_in_schema=False)
-def embeddings(request: EmbeddingRequest):
-    """
-    **Feature Extraction.**
-
-    Generates vector embeddings for the input text(s).
-    Requires a model with task `feature-extraction`.
-    """
-    texts = request.input if isinstance(request.input, list) else [request.input]
-    return engine.embeddings(request.model, texts, request.options)
+async def embeddings(req: EmbeddingRequest) -> Dict[str, Any]:
+    async with GPU_LOCK:
+        inp = [req.input] if isinstance(req.input, str) else req.input
+        return engine.embeddings(req.model, inp, req.options)
 
 
-@app.post("/api/transcribe", tags=["Inference"], summary="Audio Transcription")
+@app.post("/api/transcribe", tags=["Inference"])
 async def transcribe(
-    model: str = Form(..., description="ASR Model ID"),
-    file: UploadFile = File(..., description="Audio file (wav, mp3, m4a)"),
-    options: str = Form("{}", description="JSON string of generation options"),
-):
-    """
-    **Speech-to-Text.**
-
-    Multipart upload for audio transcription.
-
-    - **model**: Must be an `automatic-speech-recognition` model (e.g., Whisper).
-    - **options**: Can include `chunk_length_s`, `return_timestamps`, etc.
-    """
+    model: str = Form(...), file: UploadFile = File(...), options: str = Form("{}")
+) -> Dict[str, Any]:
+    try:
+        opt = json.loads(options)
+    except Exception:
+        opt = {}
     temp_path = TEMP_DIR / file.filename
     try:
-        with open(temp_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-        return engine.transcribe(model, str(temp_path), json.loads(options))
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        async with GPU_LOCK:
+            return engine.transcribe(model, str(temp_path), opt)
     finally:
         temp_path.unlink(missing_ok=True)
 
 
-@app.post("/api/vision", tags=["Inference"], summary="Vision Helper")
+@app.post("/api/vision", tags=["Inference"])
 async def vision(
-    model: str = Form(..., description="VLM Model ID"),
-    prompt: str = Form(..., description="Text prompt about the image"),
-    file: UploadFile = File(..., description="Image file"),
-    options: str = Form("{}", description="JSON string of options"),
-):
-    """
-    **Image-to-Text Helper.**
-
-    Convenience endpoint handling file upload + base64 conversion + generation in one step.
-    Useful for clients that don't want to handle base64 encoding manually.
-    """
-    temp_path = TEMP_DIR / file.filename
+    model: str = Form(...),
+    prompt: str = Form(...),
+    file: UploadFile = File(...),
+    options: str = Form("{}"),
+) -> Dict[str, Any]:
     try:
-        with open(temp_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-        with open(temp_path, "rb") as f:
-            img_b64 = base64.b64encode(f.read()).decode()
-        return engine.generate(model, prompt, [img_b64], options=json.loads(options))
-    finally:
-        temp_path.unlink(missing_ok=True)
+        opt = json.loads(options)
+    except Exception:
+        opt = {}
+    content = await file.read()
+    b64 = base64.b64encode(content).decode("utf-8")
+    async with GPU_LOCK:
+        res = engine.chat(model, [{"role": "user", "content": prompt, "images": [b64]}], opt)
+        return {
+            "model": res["model"],
+            "created_at": res["created_at"],
+            "response": res["message"]["content"],
+            "done": True,
+            "total_duration": res["total_duration"],
+            "eval_count": res["eval_count"],
+        }
 
 
 # Legacy
-@app.get("/available-models", tags=["Legacy"], include_in_schema=False)
-def list_available():
-    """
-    List all models configured in models.json.
-
-    This is a legacy endpoint providing raw access to the server's
-    allow-list configuration.
-
-    Returns
-    -------
-    dict
-        A dictionary mapping model IDs to their full configuration objects.
-    """
-    return {k: v.model_dump() for k, v in manager.get_allowed_models().items()}
+@app.get("/available-models", tags=["Models"], deprecated=True)
+def list_available_legacy() -> Dict[str, Any]:
+    return {k: v.model_dump() for k, v in manager.get_allowed().items()}
 
 
-@app.get("/models", tags=["Legacy"], include_in_schema=False)
-def list_downloaded():
-    """
-    List all models currently present in the local registry.
-
-    This is a legacy endpoint providing raw access to the internal
-    registry state, including download status and local paths.
-
-    Returns
-    -------
-    dict
-        A dictionary mapping model IDs to their registry status objects.
-    """
+@app.get("/models", tags=["Models"], deprecated=True)
+def list_downloaded_legacy() -> Dict[str, Any]:
     return {k: v.model_dump() for k, v in manager.get_registry().items()}
