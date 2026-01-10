@@ -37,7 +37,7 @@
     },
     "BAAI/bge-reranker-v2-m3": {
         "description": "Reranker (Transformers backend).",
-        "task": "feature-extraction",
+        "task": "text-classification",
         "backend": "transformers"
     },
     "Qwen/Qwen3-4B-GGUF": {

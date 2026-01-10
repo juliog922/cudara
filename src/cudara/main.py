@@ -35,7 +35,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse
 from huggingface_hub import hf_hub_download, list_repo_files, login, snapshot_download
 from pydantic import BaseModel
-from transformers import AutoModel, AutoTokenizer, pipeline
+from transformers import AutoModel, AutoTokenizer, pipeline, AutoModelForSequenceClassification
 
 # GGUF Backend (Soft Import)
 Llama = None
@@ -224,6 +224,7 @@ class ModelManager:
             if config.backend == "transformers" or config.task in [
                 "automatic-speech-recognition",
                 "feature-extraction",
+                "text-classification",
             ]:
                 local_dir = MODELS_DIR / model_id.replace("/", "--")
                 snapshot_download(repo_id=model_id, local_dir=local_dir)
@@ -329,6 +330,7 @@ class InferenceEngine:
             if config.backend == "transformers" or config.task in [
                 "automatic-speech-recognition",
                 "feature-extraction",
+                "text-classification",
             ]:
                 self._load_transformers(config, reg.local_path)
             else:
@@ -349,6 +351,12 @@ class InferenceEngine:
         elif config.task == "feature-extraction":
             tokenizer = AutoTokenizer.from_pretrained(path)
             model = AutoModel.from_pretrained(path, trust_remote_code=True).to(device)
+            self.model_instance = (model, tokenizer)
+        elif config.task == "text-classification":
+            tokenizer = AutoTokenizer.from_pretrained(path)
+            model = AutoModelForSequenceClassification.from_pretrained(
+                path, trust_remote_code=True
+            ).to(device)
             self.model_instance = (model, tokenizer)
         else:
             raise AppError(f"Task {config.task} not supported", 500)
@@ -443,7 +451,12 @@ class InferenceEngine:
                 texts, return_tensors="pt", padding=True, truncation=True, max_length=512
             ).to(device)
             with torch.no_grad():
-                output = model(**inputs).last_hidden_state.mean(dim=1).cpu().tolist()
+                if hasattr(model, "last_hidden_state"):
+                    output = model(**inputs).last_hidden_state.mean(dim=1).cpu().tolist()
+                elif hasattr(model, "base_model"):
+                    output = model.base_model(**inputs).last_hidden_state.mean(dim=1).cpu().tolist()
+                else:
+                    output = model(**inputs)[0].mean(dim=1).cpu().tolist()
 
         return {
             "model": model_id,
