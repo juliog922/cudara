@@ -39,5 +39,47 @@
         "description": "Reranker (Transformers backend).",
         "task": "feature-extraction",
         "backend": "transformers"
+    },
+    "Qwen/Qwen3-4B-GGUF": {
+        "description": "Generation model. GGUF Q4_K_M.",
+        "task": "text-generation",
+        "filename": "*Q4_K_M.gguf",
+        "system_prompt": "You are Qwen, a helpful assistant.",
+        "generation_defaults": {
+            "n_ctx": 0,          
+            "n_gpu_layers": -1
+        }
+    },
+
+    "Qwen/Qwen2.5-72B-Instruct-GGUF": {
+        "description": "Generation model. GGUF Q4_K_M.",
+        "task": "text-generation",
+        "filename": "*q4_k_m-00001-of-00012.gguf",
+        "system_prompt": "You are Qwen, a helpful assistant.",
+        "generation_defaults": {
+            "n_ctx": 0,          
+            "n_gpu_layers": -1
+        }
+    },
+    "unsloth/Qwen2.5-VL-72B-Instruct-GGUF": {
+        "description": "Vision Language Model.",
+        "task": "image-to-text",
+        "filename": "*Q4_K_M.gguf",
+        "projector_filename": "*mmproj*.gguf",
+        "chat_handler": "llama_cpp.llama_chat_format.Qwen2VLChatHandler",
+        "generation_defaults": {
+            "n_ctx": 0,          
+            "n_gpu_layers": -1
+        }
+    },
+    "Qwen/Qwen3-32B-GGUF": {
+        "description": "Generation model. GGUF Q4_K_M.",
+        "task": "text-generation",
+        "filename": "*Q4_K_M.gguf",
+        "system_prompt": "You are Qwen, a helpful assistant.",
+        "generation_defaults": {
+            "n_ctx": 0,          
+            "n_gpu_layers": -1
+        }
     }
 }
