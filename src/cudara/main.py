@@ -35,7 +35,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse
 from huggingface_hub import hf_hub_download, list_repo_files, login, snapshot_download
 from pydantic import BaseModel
-from transformers import AutoModel, AutoTokenizer, pipeline, AutoModelForSequenceClassification
+from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer, pipeline
 
 # GGUF Backend (Soft Import)
 Llama = None
