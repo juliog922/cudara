@@ -40,11 +40,6 @@
         "task": "text-classification",
         "backend": "transformers"
     },
-    "jinaai/jina-reranker-v2-base-multilingual": {
-        "description": "Reranker (Transformers backend).",
-        "task": "text-classification",
-        "backend": "transformers"
-    },
     "Qwen/Qwen3-4B-GGUF": {
         "description": "Generation model. GGUF Q4_K_M.",
         "task": "text-generation",
