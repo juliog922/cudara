@@ -598,7 +598,7 @@ async def generate(req: GenerateRequest) -> Dict[str, Any]:
         msg = {"role": "user", "content": req.prompt}
         if req.images:
             msg["images"] = req.images
-            
+
         # Call internal chat engine
         res = engine.chat(req.model, [msg], req.options)
 
@@ -608,7 +608,7 @@ async def generate(req: GenerateRequest) -> Dict[str, Any]:
             "response": res["message"]["content"],
             "done": res["done"],
             "total_duration": res["total_duration"],
-            "eval_count": res["eval_count"]
+            "eval_count": res["eval_count"],
         }
 
 
