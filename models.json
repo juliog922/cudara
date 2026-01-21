@@ -44,7 +44,17 @@
         "description": "Generation model. GGUF Q4_K_M.",
         "task": "text-generation",
         "filename": "*Q4_K_M.gguf",
-        "system_prompt": "You are Qwen, a helpful assistant.",
+        "system_prompt": "You are a helpful assistant.",
+        "generation_defaults": {
+            "n_ctx": 0,          
+            "n_gpu_layers": -1
+        }
+    },
+    "unsloth/Qwen3-4B-Instruct-2507-GGUF": {
+        "description": "Generation model. GGUF Q4_K_M.",
+        "task": "text-generation",
+        "filename": "*Q4_K_M.gguf",
+        "system_prompt": "You are a helpful assistant.",
         "generation_defaults": {
             "n_ctx": 0,          
             "n_gpu_layers": -1
