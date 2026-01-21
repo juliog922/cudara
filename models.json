@@ -40,6 +40,11 @@
         "task": "text-classification",
         "backend": "transformers"
     },
+    "jinaai/jina-reranker-v2-base-multilingual": {
+        "description": "Reranker (Transformers backend).",
+        "task": "text-classification",
+        "backend": "transformers"
+    },
     "Qwen/Qwen3-4B-GGUF": {
         "description": "Generation model. GGUF Q4_K_M.",
         "task": "text-generation",
@@ -55,8 +60,8 @@
         "task": "text-generation",
         "filename": "*Q4_K_M.gguf",
         "system_prompt": "You are a helpful assistant.",
-        "generation_defaults": {
-            "n_ctx": 0,          
+        "generation_defaults": { 
+            "n_ctx": 4096,       
             "n_gpu_layers": -1
         }
     },
