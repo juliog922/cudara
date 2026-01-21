@@ -408,6 +408,9 @@ class InferenceEngine:
 
         defaults = self.manager.get_allowed()[model_id].generation_defaults or {}
         kwargs = {**defaults, **options}
+        if "num_predict" in kwargs:
+            kwargs["max_tokens"] = kwargs.pop("num_predict")
+
         for k in ["n_gpu_layers", "n_ctx", "n_batch"]:
             kwargs.pop(k, None)
 
@@ -595,7 +598,18 @@ async def generate(req: GenerateRequest) -> Dict[str, Any]:
         msg = {"role": "user", "content": req.prompt}
         if req.images:
             msg["images"] = req.images
-        return engine.chat(req.model, [msg], req.options)
+            
+        # Call internal chat engine
+        res = engine.chat(req.model, [msg], req.options)
+
+        return {
+            "model": res["model"],
+            "created_at": res["created_at"],
+            "response": res["message"]["content"],
+            "done": res["done"],
+            "total_duration": res["total_duration"],
+            "eval_count": res["eval_count"]
+        }
 
 
 @app.post("/api/chat", tags=["Inference"])
