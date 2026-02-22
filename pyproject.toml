@@ -65,6 +65,7 @@ packages = ["src/cudara"]
 [tool.uv]
 package = true
 dev-dependencies = [
+    "mypy>=1.19.1",
     "pytest>=9.0.2",
     "pytest-asyncio>=1.3.0",
     "pytest-cov>=7.0.0",
@@ -90,18 +91,6 @@ markers = [
     "slow: Slow tests (model loading, inference)",
 ]
 
-[tool.ruff]
-line-length = 100
-target-version = "py312"
-
-[tool.ruff.lint]
-select = ["E", "F", "W", "I"]
-ignore = ["E501"]
-
-[tool.ruff.format]
-quote-style = "double"
-indent-style = "space"
-
 [tool.coverage.run]
 source = ["src/cudara"]
 omit = ["tests/*", "*/__pycache__/*"]
@@ -115,3 +104,24 @@ exclude_lines = [
 
 [project.scripts]
 cudara = "cudara.main:app"
+
+[tool.ruff.lint]
+# Add "D1" to enable checks for missing docstrings
+# E, F, I are standard (Errors, Pyflakes, Imports)
+select = ["E", "F", "I", "D1"]
+
+# D100: Missing docstring in public module (top of file)
+# D104: Missing docstring in public package (__init__.py)
+# D107: Missing docstring in __init__ (usually covered by class docstring)
+ignore = ["D100", "D104", "D107"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"  # or "numpy", "pep257"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.format]
+# Optional: Enable specific formatting preferences
+quote-style = "double"
+indent-style = "space"

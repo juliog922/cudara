@@ -88,9 +88,7 @@ def cmd_list(args: argparse.Namespace) -> None:
 
             models = data.get("models", [])
             if not models:
-                print(
-                    "No models available. Add models to models.json and use 'cudara pull <model>'"
-                )
+                print("No models available. Add models to models.json and use 'cudara pull <model>'")
                 return
 
             print(f"{'NAME':<50} {'STATUS':<15} {'DESCRIPTION'}")
@@ -151,7 +149,7 @@ def cmd_rm(args: argparse.Namespace) -> None:
 
 
 def cmd_run(args: argparse.Namespace) -> None:
-    """Run a single completion prompt."""
+    """Run a single completion prompt with streaming."""
     try:
         with get_client(args.host, timeout=600.0) as client:
             if args.prompt:
@@ -169,24 +167,31 @@ def cmd_run(args: argparse.Namespace) -> None:
             payload: Dict[str, Any] = {
                 "model": args.model,
                 "prompt": prompt,
-                "stream": False,
+                "stream": True,  # Enabled NDJSON Streaming
             }
             if args.system:
                 payload["system"] = args.system
 
-            response = client.post("/api/generate", json=payload)
-            if response.status_code == 404:
-                print_error(f"Model '{args.model}' not found or not ready")
-                sys.exit(1)
+            with client.stream("POST", "/api/generate", json=payload) as response:
+                if response.status_code == 404:
+                    print_error(f"Model '{args.model}' not found or not ready")
+                    sys.exit(1)
 
-            response.raise_for_status()
-            data = response.json()
-            print(data.get("response", ""))
+                response.raise_for_status()
 
-            if args.verbose:
-                duration_ms = data.get("total_duration", 0) / 1_000_000
-                tokens = data.get("eval_count", 0)
-                print_info(f"\n[{tokens} tokens, {duration_ms:.0f}ms]")
+                tokens = 0
+                duration_ms = 0
+                for line in response.iter_lines():
+                    if line:
+                        data = json.loads(line)
+                        print(data.get("response", ""), end="", flush=True)
+                        if data.get("done"):
+                            tokens = data.get("eval_count", 0)
+                            duration_ms = data.get("total_duration", 0) / 1_000_000
+                print()
+
+                if args.verbose:
+                    print_info(f"\n[{tokens} tokens, {duration_ms:.0f}ms]")
 
     except Exception as e:
         print_error(str(e))
@@ -194,7 +199,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 
 def cmd_chat(args: argparse.Namespace) -> None:
-    """Start an interactive chat session."""
+    """Start an interactive chat session with streaming."""
     try:
         with get_client(args.host, timeout=600.0) as client:
             response = client.post("/api/show", json={"name": args.model})
@@ -226,15 +231,22 @@ def cmd_chat(args: argparse.Namespace) -> None:
                     continue
 
                 messages.append({"role": "user", "content": user_input})
-                response = client.post(
-                    "/api/chat",
-                    json={"model": args.model, "messages": messages, "stream": False},
-                )
-                response.raise_for_status()
-                data = response.json()
-                assistant_msg = data.get("message", {}).get("content", "")
+                assistant_msg = ""
+
+                print()
+                with client.stream(
+                    "POST", "/api/chat", json={"model": args.model, "messages": messages, "stream": True}
+                ) as stream_response:
+                    stream_response.raise_for_status()
+                    for line in stream_response.iter_lines():
+                        if line:
+                            data = json.loads(line)
+                            chunk = data.get("message", {}).get("content", "")
+                            print(chunk, end="", flush=True)
+                            assistant_msg += chunk
+
+                print("\n")
                 messages.append({"role": "assistant", "content": assistant_msg})
-                print(f"\n{assistant_msg}\n")
 
     except KeyboardInterrupt:
         print("\nGoodbye!")

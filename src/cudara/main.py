@@ -32,14 +32,14 @@ import torch
 
 # FastAPI & Tools
 from fastapi import BackgroundTasks, FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from huggingface_hub import hf_hub_download, list_repo_files, login, snapshot_download
 from pydantic import BaseModel
 from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer, pipeline
 
 # GGUF Backend (Soft Import)
-Llama = None
-Llava15ChatHandler = None
+Llama: Any = None
+Llava15ChatHandler: Any = None
 
 try:
     from llama_cpp import Llama
@@ -87,6 +87,8 @@ IDLE_TIMEOUT_SECONDS = 300  # 5 minutes
 # DATA MODELS
 # =============================================================================
 class AppError(Exception):
+    """Custom exception for API errors."""
+
     def __init__(self, message: str, status_code: int = 500, code: str = "error"):
         self.message = message
         self.status_code = status_code
@@ -94,12 +96,16 @@ class AppError(Exception):
 
 
 class ModelStatus(str, Enum):
+    """Enumeration for model download states."""
+
     DOWNLOADING = "downloading"
     READY = "ready"
     ERROR = "error"
 
 
 class ModelConfig(BaseModel):
+    """Configuration for an allowed model."""
+
     description: Optional[str] = None
     task: str = "text-generation"
     backend: str = "llama-cpp"
@@ -110,6 +116,8 @@ class ModelConfig(BaseModel):
 
 
 class RegistryItem(BaseModel):
+    """Status and paths for a downloaded model."""
+
     status: ModelStatus
     local_path: Optional[str] = None
     projector_path: Optional[str] = None
@@ -118,15 +126,21 @@ class RegistryItem(BaseModel):
 
 
 class ModelIdentifier(BaseModel):
+    """Identifier for a model in requests."""
+
     name: str
 
 
 class PullRequest(BaseModel):
+    """Request schema for pulling a model."""
+
     name: str
     stream: bool = False
 
 
 class GenerateRequest(BaseModel):
+    """Request schema for text generation."""
+
     model: str
     prompt: str
     system: Optional[str] = None
@@ -136,12 +150,16 @@ class GenerateRequest(BaseModel):
 
 
 class ChatMessage(BaseModel):
+    """A single message in a chat completion."""
+
     role: str
     content: str
     images: Optional[List[str]] = None
 
 
 class ChatRequest(BaseModel):
+    """Request schema for chat completions."""
+
     model: str
     messages: List[ChatMessage]
     stream: bool = False
@@ -149,6 +167,8 @@ class ChatRequest(BaseModel):
 
 
 class EmbeddingRequest(BaseModel):
+    """Request schema for embeddings."""
+
     model: str
     input: Union[str, List[str]]
     options: Dict[str, Any] = {}
@@ -158,6 +178,8 @@ class EmbeddingRequest(BaseModel):
 # MODEL MANAGER
 # =============================================================================
 class ModelManager:
+    """Manages model configurations and downloads."""
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         if not REGISTRY_FILE.exists():
@@ -181,14 +203,17 @@ class ModelManager:
                 return {}
 
     def get_allowed(self) -> Dict[str, ModelConfig]:
+        """Retrieve all allowed models."""
         data = self._load_json(ALLOWED_MODELS_FILE)
         return {k: ModelConfig(**v) for k, v in data.items() if not k.startswith("_")}
 
     def get_registry(self) -> Dict[str, RegistryItem]:
+        """Retrieve the local model registry."""
         data = self._load_json(REGISTRY_FILE)
         return {k: RegistryItem(**v) for k, v in data.items()}
 
     def update_registry(self, model_id: str, **kwargs: Any) -> None:
+        """Update a model's registry entry."""
         reg = self._load_json(REGISTRY_FILE)
         entry = reg.get(model_id, {})
         entry.update(kwargs)
@@ -196,6 +221,7 @@ class ModelManager:
         self._save_json(REGISTRY_FILE, reg)
 
     def get_model_info(self, model_id: str) -> Optional[Dict[str, Any]]:
+        """Get detailed information about a model."""
         config = self.get_allowed().get(model_id)
         reg = self.get_registry().get(model_id)
         if not config:
@@ -207,14 +233,13 @@ class ModelManager:
             "details": {
                 "format": "gguf" if config.backend != "transformers" else "transformers",
                 "family": config.task,
-                "quantization_level": reg.details.get("quantization", "unknown")
-                if reg
-                else "unknown",
+                "quantization_level": reg.details.get("quantization", "unknown") if reg else "unknown",
             },
             "model_info": config.model_dump(),
         }
 
     def download_task(self, model_id: str) -> None:
+        """Background task to download a model from Hugging Face."""
         config = self.get_allowed().get(model_id)
         if not config:
             return
@@ -244,9 +269,7 @@ class ModelManager:
                 if config.projector_filename:
                     p_matches = fnmatch.filter(files, config.projector_filename)
                     if p_matches:
-                        proj_path = hf_hub_download(
-                            repo_id=model_id, filename=p_matches[0], local_dir=MODELS_DIR
-                        )
+                        proj_path = hf_hub_download(repo_id=model_id, filename=p_matches[0], local_dir=MODELS_DIR)
 
                 quant = target_file.split(".")[-2] if "Q" in target_file else "unknown"
                 self.update_registry(
@@ -264,6 +287,7 @@ class ModelManager:
             self.update_registry(model_id, status=ModelStatus.ERROR, error_message=str(e))
 
     def delete_model(self, model_id: str) -> None:
+        """Delete a model from disk and registry."""
         reg = self.get_registry().get(model_id)
         if reg and reg.local_path:
             p = Path(reg.local_path)
@@ -284,6 +308,8 @@ class ModelManager:
 # INFERENCE ENGINE
 # =============================================================================
 class InferenceEngine:
+    """Handles loading and executing model inference."""
+
     def __init__(self, manager: ModelManager) -> None:
         self.manager = manager
         self.active_id: Optional[str] = None
@@ -307,6 +333,7 @@ class InferenceEngine:
                 torch.cuda.ipc_collect()
 
     def load(self, model_id: str) -> None:
+        """Load a model into VRAM."""
         # Implicitly touch when checking/loading
         self.touch()
 
@@ -326,6 +353,9 @@ class InferenceEngine:
 
             logger.info(f"🚀 Loading {model_id} ({config.backend})...")
             start = time.perf_counter()
+
+            if not reg.local_path:
+                raise AppError(f"Model {model_id} has no valid local_path", 500, "model_corrupted")
 
             if config.backend == "transformers" or config.task in [
                 "automatic-speech-recognition",
@@ -354,15 +384,13 @@ class InferenceEngine:
             self.model_instance = (model, tokenizer)
         elif config.task == "text-classification":
             tokenizer = AutoTokenizer.from_pretrained(path)
-            model = AutoModelForSequenceClassification.from_pretrained(
-                path, trust_remote_code=True
-            ).to(device)
+            model = AutoModelForSequenceClassification.from_pretrained(path, trust_remote_code=True).to(device)
             self.model_instance = (model, tokenizer)
         else:
             raise AppError(f"Task {config.task} not supported", 500)
 
     def _load_gguf(self, config: ModelConfig, path: str, projector_path: Optional[str]) -> None:
-        if not Llama:
+        if Llama is None:
             raise AppError("llama-cpp-python missing", 500)
 
         params = config.generation_defaults.copy()
@@ -386,11 +414,12 @@ class InferenceEngine:
             verbose=False,
         )
 
-    # --- Methods (Updated to call self.touch()) ---
-
-    def chat(self, model_id: str, messages: List[Dict], options: Dict[str, Any]) -> Dict[str, Any]:
+    def chat(self, model_id: str, messages: List[Dict], options: Dict[str, Any], stream: bool = False) -> Any:
+        """Execute a chat completion."""
         self.load(model_id)
-        if not isinstance(self.model_instance, Llama):
+        if Llama is None or not isinstance(self.model_instance, Llama):
+            if stream:
+                raise AppError("Streaming only supported for GGUF models", 400)
             raise AppError("Chat supported only for GGUF", 400)
 
         # Prepare messages
@@ -399,9 +428,7 @@ class InferenceEngine:
             if m.get("images"):
                 content = [{"type": "text", "text": m["content"]}]
                 for img in m["images"]:
-                    content.append(
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}}
-                    )
+                    content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
                 fmt_msgs.append({"role": m["role"], "content": content})
             else:
                 fmt_msgs.append({"role": m["role"], "content": m["content"]})
@@ -414,10 +441,30 @@ class InferenceEngine:
         for k in ["n_gpu_layers", "n_ctx", "n_batch"]:
             kwargs.pop(k, None)
 
-        res = self.model_instance.create_chat_completion(messages=fmt_msgs, **kwargs)
-        duration = int(
-            (time.perf_counter() - self.last_interaction) * 1e9
-        )  # Approx since load calls touch
+        res = self.model_instance.create_chat_completion(messages=fmt_msgs, stream=stream, **kwargs)
+
+        if stream:
+
+            def sync_gen():
+                for chunk in res:
+                    delta = chunk["choices"][0].get("delta", {})
+                    content = delta.get("content", "")
+                    role = delta.get("role", "assistant")
+                    yield (
+                        json.dumps(
+                            {
+                                "model": model_id,
+                                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                "message": {"role": role, "content": content},
+                                "done": chunk["choices"][0].get("finish_reason") is not None,
+                            }
+                        )
+                        + "\n"
+                    )
+
+            return sync_gen()
+
+        duration = int((time.perf_counter() - self.last_interaction) * 1e9)  # Approx since load calls touch
 
         return {
             "model": model_id,
@@ -425,16 +472,15 @@ class InferenceEngine:
             "message": res["choices"][0]["message"],
             "done": True,
             "total_duration": duration,
-            "eval_count": res["usage"]["completion_tokens"],
+            "eval_count": res["usage"]["completion_tokens"] if "usage" in res else 0,
         }
 
-    def embeddings(
-        self, model_id: str, texts: List[str], options: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    def embeddings(self, model_id: str, texts: List[str], options: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate embeddings."""
         self.load(model_id)
         start = time.perf_counter()
 
-        if isinstance(self.model_instance, Llama):
+        if Llama is not None and isinstance(self.model_instance, Llama):
             raise AppError("Use transformers for embeddings", 400)
 
         model, tokenizer = self.model_instance
@@ -443,16 +489,12 @@ class InferenceEngine:
         sep = options.get("pair_sep", "\u241e")
         if any(sep in t for t in texts):
             pairs = [t.split(sep, 1) for t in texts]
-            inputs = tokenizer(
-                pairs, return_tensors="pt", padding=True, truncation=True, max_length=512
-            ).to(device)
+            inputs = tokenizer(pairs, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
             with torch.no_grad():
                 scores = model(**inputs).logits.view(-1).float().cpu().tolist()
             output = [[s] for s in scores]
         else:
-            inputs = tokenizer(
-                texts, return_tensors="pt", padding=True, truncation=True, max_length=512
-            ).to(device)
+            inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
             with torch.no_grad():
                 if hasattr(model, "last_hidden_state"):
                     output = model(**inputs).last_hidden_state.mean(dim=1).cpu().tolist()
@@ -468,6 +510,7 @@ class InferenceEngine:
         }
 
     def transcribe(self, model_id: str, file_path: str, options: Dict[str, Any]) -> Dict[str, Any]:
+        """Transcribe an audio file."""
         self.load(model_id)
         start = time.perf_counter()
         res = self.model_instance(file_path, **options)
@@ -490,9 +533,7 @@ async def monitor_idle_models(engine_ref: InferenceEngine):
             if engine_ref.active_id:
                 idle_time = time.time() - engine_ref.last_interaction
                 if idle_time > IDLE_TIMEOUT_SECONDS:
-                    logger.info(
-                        f"⏱️ Idle timeout ({idle_time:.0f}s > {IDLE_TIMEOUT_SECONDS}s). Unloading..."
-                    )
+                    logger.info(f"⏱️ Idle timeout ({idle_time:.0f}s > {IDLE_TIMEOUT_SECONDS}s). Unloading...")
                     async with GPU_LOCK:
                         engine_ref._unload()
         except asyncio.CancelledError:
@@ -503,6 +544,7 @@ async def monitor_idle_models(engine_ref: InferenceEngine):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """FastAPI lifespan manager to handle background tasks."""
     # Startup
     monitor_task = asyncio.create_task(monitor_idle_models(engine))
     yield
@@ -528,29 +570,28 @@ app = FastAPI(
 
 @app.exception_handler(AppError)
 async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
-    return JSONResponse(
-        status_code=exc.status_code, content={"error": {"code": exc.code, "message": exc.message}}
-    )
+    """Handle AppError exceptions and format JSON response."""
+    return JSONResponse(status_code=exc.status_code, content={"error": {"code": exc.code, "message": exc.message}})
 
 
-# --- Routes (Same as before) ---
+# --- Routes ---
 
 
 @app.get("/", tags=["Health"])
 @app.get("/health", tags=["Health"])
 def health() -> Dict[str, Any]:
+    """Check the health and status of the server."""
     return {
         "status": "ok",
         "active_model": engine.active_id,
         "cuda_available": torch.cuda.is_available(),
-        "vram_used": f"{torch.cuda.memory_allocated() / 1024**3:.1f}GB"
-        if torch.cuda.is_available()
-        else "0GB",
+        "vram_used": f"{torch.cuda.memory_allocated() / 1024**3:.1f}GB" if torch.cuda.is_available() else "0GB",
     }
 
 
 @app.get("/api/tags", tags=["Models"])
 def list_models() -> Dict[str, List[Dict]]:
+    """List all available models."""
     allowed = manager.get_allowed()
     reg = manager.get_registry()
     models_list = []
@@ -559,9 +600,16 @@ def list_models() -> Dict[str, List[Dict]]:
         models_list.append(
             {
                 "name": k,
+                # Ollama compatibility fields
+                "modified_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "size": 1000000000,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                # Cudara custom fields (keeps cudara_client happy)
                 "status": r.status.value if r else "not_downloaded",
-                "details": r.details if r else {"format": "gguf"},
                 "description": v.description,
+                "details": r.details
+                if r
+                else {"format": "gguf", "family": v.task, "parameter_size": "unknown", "quantization_level": "unknown"},
             }
         )
     return {"models": models_list}
@@ -569,6 +617,7 @@ def list_models() -> Dict[str, List[Dict]]:
 
 @app.post("/api/show", tags=["Models"])
 def show_model(req: ModelIdentifier) -> Dict[str, Any]:
+    """Show details of a specific model."""
     info = manager.get_model_info(req.name)
     if not info:
         raise AppError("Model not found", 404, "model_not_found")
@@ -576,16 +625,29 @@ def show_model(req: ModelIdentifier) -> Dict[str, Any]:
 
 
 @app.post("/api/pull", tags=["Models"])
-def pull_model(req: PullRequest, bg: BackgroundTasks) -> Dict[str, str]:
+async def pull_model(req: PullRequest, bg: BackgroundTasks) -> Any:
+    """Trigger a background download of a model."""
     if req.name not in manager.get_allowed():
         raise AppError("Model not allowed", 403, "model_not_allowed")
     manager.update_registry(req.name, status=ModelStatus.DOWNLOADING)
-    bg.add_task(manager.download_task, req.name)
-    return {"status": "downloading"}
+
+    if req.stream:
+
+        async def stream_generator():
+            yield json.dumps({"status": "pulling manifest"}) + "\n"
+            yield json.dumps({"status": "downloading", "digest": "sha256:...", "total": 100, "completed": 0}) + "\n"
+            await asyncio.to_thread(manager.download_task, req.name)
+            yield json.dumps({"status": "success"}) + "\n"
+
+        return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
+    else:
+        bg.add_task(manager.download_task, req.name)
+        return {"status": "downloading"}
 
 
 @app.delete("/api/delete", tags=["Models"])
 def delete_model(req: ModelIdentifier) -> Dict[str, str]:
+    """Delete a downloaded model."""
     if engine.active_id == req.name:
         engine._unload()
     manager.delete_model(req.name)
@@ -593,53 +655,98 @@ def delete_model(req: ModelIdentifier) -> Dict[str, str]:
 
 
 @app.post("/api/generate", tags=["Inference"])
-async def generate(req: GenerateRequest) -> Dict[str, Any]:
-    async with GPU_LOCK:
-        msg = {"role": "user", "content": req.prompt}
-        if req.images:
-            msg["images"] = req.images
+async def generate(req: GenerateRequest) -> Any:
+    """Generate text from a single prompt."""
+    msg: Dict[str, Any] = {"role": "user", "content": req.prompt}
+    if req.images:
+        msg["images"] = req.images
 
-        # Call internal chat engine
-        res = engine.chat(req.model, [msg], req.options)
+    if req.stream:
 
-        return {
-            "model": res["model"],
-            "created_at": res["created_at"],
-            "response": res["message"]["content"],
-            "done": res["done"],
-            "total_duration": res["total_duration"],
-            "eval_count": res["eval_count"],
-        }
+        async def stream_generator():
+            async with GPU_LOCK:
+                gen = await asyncio.to_thread(engine.chat, req.model, [msg], req.options, True)
+                while True:
+                    # Pass `None` as a sentinel to avoid StopIteration exceptions crashing the stream
+                    chunk_str = await asyncio.to_thread(next, gen, None)
+                    if chunk_str is None:
+                        break
+
+                    chunk = json.loads(chunk_str)
+                    yield (
+                        json.dumps(
+                            {
+                                "model": chunk["model"],
+                                "created_at": chunk["created_at"],
+                                "response": chunk.get("message", {}).get("content", ""),
+                                "done": chunk.get("done", False),
+                            }
+                        )
+                        + "\n"
+                    )
+
+        return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
+    else:
+        async with GPU_LOCK:
+            res = await asyncio.to_thread(engine.chat, req.model, [msg], req.options, False)
+            return {
+                "model": res["model"],
+                "created_at": res["created_at"],
+                "response": res["message"]["content"],
+                "done": res["done"],
+                "total_duration": res.get("total_duration", 0),
+                "eval_count": res.get("eval_count", 0),
+            }
 
 
 @app.post("/api/chat", tags=["Inference"])
-async def chat(req: ChatRequest) -> Dict[str, Any]:
-    async with GPU_LOCK:
-        return engine.chat(req.model, [m.model_dump() for m in req.messages], req.options)
+async def chat(req: ChatRequest) -> Any:
+    """Generate a response from a sequence of chat messages."""
+    if req.stream:
+
+        async def stream_generator():
+            async with GPU_LOCK:
+                gen = await asyncio.to_thread(
+                    engine.chat, req.model, [m.model_dump() for m in req.messages], req.options, True
+                )
+                while True:
+                    chunk_str = await asyncio.to_thread(next, gen, None)
+                    if chunk_str is None:
+                        break
+                    yield chunk_str
+
+        return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
+    else:
+        async with GPU_LOCK:
+            return await asyncio.to_thread(
+                engine.chat, req.model, [m.model_dump() for m in req.messages], req.options, False
+            )
 
 
 @app.post("/api/embeddings", tags=["Inference"])
 @app.post("/api/embed", tags=["Inference"], include_in_schema=False)
 async def embeddings(req: EmbeddingRequest) -> Dict[str, Any]:
+    """Generate vector embeddings for input text."""
     async with GPU_LOCK:
         inp = [req.input] if isinstance(req.input, str) else req.input
-        return engine.embeddings(req.model, inp, req.options)
+        return await asyncio.to_thread(engine.embeddings, req.model, inp, req.options)
 
 
 @app.post("/api/transcribe", tags=["Inference"])
-async def transcribe(
-    model: str = Form(...), file: UploadFile = File(...), options: str = Form("{}")
-) -> Dict[str, Any]:
+async def transcribe(model: str = Form(...), file: UploadFile = File(...), options: str = Form("{}")) -> Dict[str, Any]:
+    """Transcribe speech from an audio file."""
     try:
         opt = json.loads(options)
     except Exception:
         opt = {}
-    temp_path = TEMP_DIR / file.filename
+
+    filename = file.filename or "audio.wav"
+    temp_path = TEMP_DIR / filename
     try:
         with open(temp_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         async with GPU_LOCK:
-            return engine.transcribe(model, str(temp_path), opt)
+            return await asyncio.to_thread(engine.transcribe, model, str(temp_path), opt)
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -651,6 +758,7 @@ async def vision(
     file: UploadFile = File(...),
     options: str = Form("{}"),
 ) -> Dict[str, Any]:
+    """Analyze an image using a Vision-Language Model."""
     try:
         opt = json.loads(options)
     except Exception:
@@ -658,7 +766,9 @@ async def vision(
     content = await file.read()
     b64 = base64.b64encode(content).decode("utf-8")
     async with GPU_LOCK:
-        res = engine.chat(model, [{"role": "user", "content": prompt, "images": [b64]}], opt)
+        res = await asyncio.to_thread(
+            engine.chat, model, [{"role": "user", "content": prompt, "images": [b64]}], opt, False
+        )
         return {
             "model": res["model"],
             "created_at": res["created_at"],
@@ -672,9 +782,11 @@ async def vision(
 # Legacy
 @app.get("/available-models", tags=["Models"], deprecated=True)
 def list_available_legacy() -> Dict[str, Any]:
+    """List available models (legacy endpoint)."""
     return {k: v.model_dump() for k, v in manager.get_allowed().items()}
 
 
 @app.get("/models", tags=["Models"], deprecated=True)
 def list_downloaded_legacy() -> Dict[str, Any]:
+    """List downloaded models (legacy endpoint)."""
     return {k: v.model_dump() for k, v in manager.get_registry().items()}
