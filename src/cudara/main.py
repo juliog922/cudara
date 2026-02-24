@@ -120,6 +120,7 @@ class RegistryItem(BaseModel):
 
     status: ModelStatus
     local_path: Optional[str] = None
+    shard_paths: Optional[List[str]] = None
     projector_path: Optional[str] = None
     error_message: Optional[str] = None
     details: Dict[str, Any] = {}
@@ -261,9 +262,18 @@ class ModelManager:
                 matches = fnmatch.filter(files, config.filename)
                 if not matches:
                     raise FileNotFoundError(f"No file matching {config.filename}")
-                target_file = matches[0]
 
-                path = hf_hub_download(repo_id=model_id, filename=target_file, local_dir=MODELS_DIR)
+                # Sort alphabetically to ensure the first shard (e.g., -00001) is at index 0
+                matches.sort()
+
+                shard_paths = []
+                for match in matches:
+                    logger.info(f"Downloading shard: {match}")
+                    dl_path = hf_hub_download(repo_id=model_id, filename=match, local_dir=MODELS_DIR)
+                    shard_paths.append(dl_path)
+
+                # The primary path passed to llama.cpp MUST be the first shard
+                path = shard_paths[0]
 
                 proj_path = None
                 if config.projector_filename:
@@ -271,11 +281,12 @@ class ModelManager:
                     if p_matches:
                         proj_path = hf_hub_download(repo_id=model_id, filename=p_matches[0], local_dir=MODELS_DIR)
 
-                quant = target_file.split(".")[-2] if "Q" in target_file else "unknown"
+                quant = matches[0].split(".")[-2] if "Q" in matches[0] else "unknown"
                 self.update_registry(
                     model_id,
                     status=ModelStatus.READY,
                     local_path=path,
+                    shard_paths=shard_paths,
                     projector_path=proj_path,
                     details={"quantization": quant},
                 )
@@ -289,12 +300,19 @@ class ModelManager:
     def delete_model(self, model_id: str) -> None:
         """Delete a model from disk and registry."""
         reg = self.get_registry().get(model_id)
-        if reg and reg.local_path:
-            p = Path(reg.local_path)
-            if p.is_file():
-                p.unlink(missing_ok=True)
-            elif p.is_dir():
-                shutil.rmtree(p, ignore_errors=True)
+        if reg:
+            # Delete all shards if present
+            if reg.shard_paths:
+                for sp in reg.shard_paths:
+                    Path(sp).unlink(missing_ok=True)
+            # Fallback for older non-sharded registry entries
+            elif reg.local_path:
+                p = Path(reg.local_path)
+                if p.is_file():
+                    p.unlink(missing_ok=True)
+                elif p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+
             if reg.projector_path:
                 Path(reg.projector_path).unlink(missing_ok=True)
 
@@ -302,6 +320,32 @@ class ModelManager:
         if model_id in full_reg:
             del full_reg[model_id]
             self._save_json(REGISTRY_FILE, full_reg)
+
+    def get_model_size(self, model_id: str) -> int:
+        """Calculate the total size of a downloaded model in bytes."""
+        reg = self.get_registry().get(model_id)
+        if not reg or reg.status != ModelStatus.READY:
+            return 0
+
+        total_size = 0
+        try:
+            if reg.shard_paths:
+                for path in reg.shard_paths:
+                    total_size += Path(path).stat().st_size
+            elif reg.local_path:
+                p = Path(reg.local_path)
+                if p.is_file():
+                    total_size += p.stat().st_size
+                elif p.is_dir():
+                    # Sum all files in directory for transformers backends
+                    total_size += sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+
+            if reg.projector_path:
+                total_size += Path(reg.projector_path).stat().st_size
+        except OSError:
+            pass  # File might have been deleted manually
+
+        return total_size
 
 
 # =============================================================================
@@ -602,7 +646,7 @@ def list_models() -> Dict[str, List[Dict]]:
                 "name": k,
                 # Ollama compatibility fields
                 "modified_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "size": 1000000000,
+                "size": manager.get_model_size(k) if r and r.status.value == "ready" else 0,
                 "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
                 # Cudara custom fields (keeps cudara_client happy)
                 "status": r.status.value if r else "not_downloaded",
