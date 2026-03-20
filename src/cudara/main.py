@@ -447,7 +447,6 @@ class InferenceEngine:
         n_gpu = params.pop("n_gpu_layers", -1)
         n_ctx = params.pop("n_ctx", 4096)
 
-        # Auto-detect context window if 0
         if n_ctx == 0:
             n_ctx = 0
 
@@ -457,13 +456,8 @@ class InferenceEngine:
         if config.task == "image-to-text" and projector_path:
             if "qwen" in path.lower():
                 chat_format = "chatml"
-                try:
-                    from llama_cpp.llama_chat_format import Qwen2VLChatHandler
-
+                if Qwen2VLChatHandler:
                     chat_handler = Qwen2VLChatHandler(clip_model_path=projector_path)
-                except ImportError:
-                    pass
-            # Fallback para LLaVA u otros
             elif Llava15ChatHandler:
                 chat_handler = Llava15ChatHandler(clip_model_path=projector_path)
 
