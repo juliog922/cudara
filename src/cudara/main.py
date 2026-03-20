@@ -40,12 +40,18 @@ from transformers import AutoModel, AutoModelForSequenceClassification, AutoToke
 # GGUF Backend (Soft Import)
 Llama: Any = None
 Llava15ChatHandler: Any = None
+Qwen2VLChatHandler: Any = None
 
 try:
     from llama_cpp import Llama
 
     try:
         from llama_cpp.llama_chat_format import Llava15ChatHandler
+    except ImportError:
+        pass
+
+    try:
+        from llama_cpp.llama_chat_format import Qwen2VLChatHandler
     except ImportError:
         pass
 except ImportError:
@@ -447,13 +453,9 @@ class InferenceEngine:
 
         chat_handler = None
         if config.task == "image-to-text" and projector_path:
-            if "qwen" in path.lower():
-                try:
-                    from llama_cpp.llama_chat_format import Qwen2VLChatHandler
-
-                    chat_handler = Qwen2VLChatHandler(clip_model_path=projector_path)
-                except ImportError:
-                    pass
+            if "qwen" in path.lower() and Qwen2VLChatHandler:
+                chat_handler = Qwen2VLChatHandler(clip_model_path=projector_path)
+            # Fallback
             elif Llava15ChatHandler:
                 chat_handler = Llava15ChatHandler(clip_model_path=projector_path)
 
