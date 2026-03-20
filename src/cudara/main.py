@@ -447,7 +447,13 @@ class InferenceEngine:
 
         chat_handler = None
         if config.task == "image-to-text" and projector_path:
-            if Llava15ChatHandler:
+            if "qwen" in path.lower():
+                try:
+                    from llama_cpp.llama_chat_format import Qwen2VLChatHandler
+                    chat_handler = Qwen2VLChatHandler(clip_model_path=projector_path)
+                except ImportError:
+                    pass
+            elif Llava15ChatHandler:
                 chat_handler = Llava15ChatHandler(clip_model_path=projector_path)
 
         self.model_instance = Llama(
@@ -461,6 +467,8 @@ class InferenceEngine:
     def chat(self, model_id: str, messages: List[Dict], options: Dict[str, Any], stream: bool = False) -> Any:
         """Execute a chat completion."""
         self.load(model_id)
+        chat_start = time.perf_counter()
+
         if Llama is None or not isinstance(self.model_instance, Llama):
             if stream:
                 raise AppError("Streaming only supported for GGUF models", 400)
@@ -508,7 +516,7 @@ class InferenceEngine:
 
             return sync_gen()
 
-        duration = int((time.perf_counter() - self.last_interaction) * 1e9)  # Approx since load calls touch
+        duration = int((time.perf_counter() - chat_start) * 1e9)
 
         return {
             "model": model_id,
