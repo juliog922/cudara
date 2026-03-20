@@ -459,6 +459,7 @@ class InferenceEngine:
                 chat_format = "chatml"
                 try:
                     from llama_cpp.llama_chat_format import Qwen2VLChatHandler
+
                     chat_handler = Qwen2VLChatHandler(clip_model_path=projector_path)
                 except ImportError:
                     pass
