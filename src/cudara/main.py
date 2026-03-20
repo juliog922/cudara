@@ -452,10 +452,17 @@ class InferenceEngine:
             n_ctx = 0
 
         chat_handler = None
+        chat_format = None
+
         if config.task == "image-to-text" and projector_path:
-            if "qwen" in path.lower() and Qwen2VLChatHandler:
-                chat_handler = Qwen2VLChatHandler(clip_model_path=projector_path)
-            # Fallback
+            if "qwen" in path.lower():
+                chat_format = "chatml"
+                try:
+                    from llama_cpp.llama_chat_format import Qwen2VLChatHandler
+                    chat_handler = Qwen2VLChatHandler(clip_model_path=projector_path)
+                except ImportError:
+                    pass
+            # Fallback para LLaVA u otros
             elif Llava15ChatHandler:
                 chat_handler = Llava15ChatHandler(clip_model_path=projector_path)
 
@@ -464,6 +471,7 @@ class InferenceEngine:
             n_gpu_layers=n_gpu,
             n_ctx=n_ctx,
             chat_handler=chat_handler,
+            chat_format=chat_format,
             verbose=False,
         )
 
