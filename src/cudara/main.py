@@ -449,7 +449,7 @@ class InferenceEngine:
 
         if config.task == "image-to-text":
             if "qwen" in path.lower():
-                chat_format = "qwen2-vl"
+                chat_format = "qwen"
             elif projector_path and Llava15ChatHandler:
                 # LLaVA sí necesita explícitamente el projector_path
                 chat_handler = Llava15ChatHandler(clip_model_path=projector_path)
