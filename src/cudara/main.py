@@ -45,7 +45,7 @@ try:
     from llama_cpp import Llama
 
     try:
-        from llama_cpp.llama_chat_format import Llava15ChatHandler
+        from llama_cpp.llama_chat_format import Llava15ChatHandler, Qwen2VLChatHandler
     except ImportError:
         pass
 except ImportError:
@@ -111,6 +111,7 @@ class ModelConfig(BaseModel):
     backend: str = "llama-cpp"
     filename: Optional[str] = None
     projector_filename: Optional[str] = None
+    chat_handler: Optional[str] = None
     system_prompt: Optional[str] = None
     generation_defaults: Dict[str, Any] = {}
 
@@ -448,11 +449,16 @@ class InferenceEngine:
         chat_format = None
 
         if config.task == "image-to-text":
-            if "qwen" in path.lower():
-                chat_format = "qwen"
+            if config.chat_handler == "llama_cpp.llama_chat_format.Qwen2VLChatHandler" and projector_path:
+                chat_handler = Qwen2VLChatHandler(clip_model_path=projector_path)
+
+            # Fallback for LLaVA
             elif projector_path and Llava15ChatHandler:
-                # LLaVA sí necesita explícitamente el projector_path
                 chat_handler = Llava15ChatHandler(clip_model_path=projector_path)
+
+            # Fallback for old Qwen text-only
+            elif "qwen" in path.lower():
+                chat_format = "qwen"
 
         self.model_instance = Llama(
             model_path=path,
