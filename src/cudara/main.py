@@ -40,6 +40,8 @@ from transformers import AutoModel, AutoModelForSequenceClassification, AutoToke
 # GGUF Backend (Soft Import)
 Llama: Any = None
 Llava15ChatHandler: Any = None
+Llava15ChatHandler: Any = None
+Qwen2VLChatHandler: Any = None
 
 try:
     from llama_cpp import Llama
