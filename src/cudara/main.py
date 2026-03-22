@@ -479,7 +479,7 @@ class InferenceEngine:
             self.unload()
             path = reg.local_path
             device = "cuda" if torch.cuda.is_available() else "cpu"
-            dtype = torch.float16 if device == "cuda" else torch.float32
+            dtype = torch.bfloat16 if device == "cuda" and torch.cuda.is_bf16_supported() else torch.float16
 
             logger.info(f"Loading {model_id} into VRAM...")
             if config.task == "text-generation":
