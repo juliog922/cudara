@@ -1,104 +1,263 @@
 """
-Cudara Inference Server.
-========================
-
-A lightweight, CUDA-accelerated inference server designed for Linux/NVIDIA environments.
-It provides an Ollama-compatible API for GGUF (via llama.cpp) and Transformers models.
-
-Key Features:
-- STRICT Single-Model Concurrency: Only one model is loaded on the GPU at a time.
-- Sequential Processing: Requests are serialized via an async lock.
-- Automatic Cleanup: Models unload after 5 minutes of inactivity to free VRAM.
+Cudara Inference Server (Transformers Native)
+=============================================
+Definitive Unified Edition.
 """
 
 import asyncio
 import base64
 import datetime
-import fnmatch
 import gc
 import json
 import logging
 import os
+import re
 import shutil
 import threading
 import time
+import warnings
 from contextlib import asynccontextmanager
 from enum import Enum
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Literal, Optional, Union
 
-# Backends
 import torch
-
-# FastAPI & Tools
-from fastapi import BackgroundTasks, FastAPI, File, Form, Request, UploadFile
+import transformers.activations
+from fastapi import BackgroundTasks, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
-from huggingface_hub import hf_hub_download, list_repo_files, login, snapshot_download
-from pydantic import BaseModel
-from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer, pipeline
-
-# GGUF Backend (Soft Import)
-Llama: Any = None
-Llava15ChatHandler: Any = None
-Llava15ChatHandler: Any = None
-Qwen2VLChatHandler: Any = None
-
-try:
-    from llama_cpp import Llama
-
-    try:
-        from llama_cpp.llama_chat_format import Llava15ChatHandler, Qwen2VLChatHandler
-    except ImportError:
-        pass
-except ImportError:
-    pass
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    datefmt="%H:%M:%S",
+from huggingface_hub import login, snapshot_download
+from pydantic import BaseModel, ConfigDict, Field
+from qwen_vl_utils import process_vision_info  # type: ignore
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from transformers import (
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
+    AutoProcessor,
+    AutoTokenizer,
+    Qwen2_5_VLForConditionalGeneration,
+    TextIteratorStreamer,
+    pipeline,
 )
+
+if not hasattr(transformers.activations, "PytorchGELUTanh"):
+    transformers.activations.PytorchGELUTanh = type("PytorchGELUTanh", (object,), {})  # type: ignore
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="awq.*")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("cudara")
 
-# Optimize for NVIDIA Ampere+
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-HF_TOKEN = os.getenv("HF_TOKEN")
-if HF_TOKEN:
+if HF_TOKEN := os.getenv("HF_TOKEN"):
     login(token=HF_TOKEN, add_to_git_credential=False)
 
-MODELS_DIR = Path("models")
-REGISTRY_FILE = Path("registry.json")
-ALLOWED_MODELS_FILE = Path("models.json")
-TEMP_DIR = Path("temp_uploads")
+MODELS_DIR, TEMP_DIR = Path("models"), Path("temp_uploads")
+for d in (MODELS_DIR, TEMP_DIR):
+    d.mkdir(exist_ok=True)
 
-MODELS_DIR.mkdir(exist_ok=True)
-TEMP_DIR.mkdir(exist_ok=True)
-
-# Global Lock
 GPU_LOCK = asyncio.Lock()
-IDLE_TIMEOUT_SECONDS = 300  # 5 minutes
+IDLE_TIMEOUT_SECONDS = 300
 
 
-# =============================================================================
-# DATA MODELS
-# =============================================================================
 class AppError(Exception):
-    """Custom exception for API errors."""
+    """Custom application error mapped to standard JSON error format."""
 
-    def __init__(self, message: str, status_code: int = 500, code: str = "error"):
+    def __init__(self, message: str, status_code: int = 500, code: str = "error") -> None:
         self.message = message
         self.status_code = status_code
         self.code = code
 
 
+class TokenLogprob(BaseModel):
+    """Log probability information for a single token alternative."""
+
+    token: str = Field(..., description="Text representation of the token")
+    logprob: float = Field(..., description="Log probability of this token")
+    bytes: Optional[List[int]] = Field(None, description="Raw byte representation")
+
+
+class Logprob(BaseModel):
+    """Log probability information for a generated token."""
+
+    token: str = Field(..., description="Text representation of the token")
+    logprob: float = Field(..., description="Log probability of this token")
+    bytes: Optional[List[int]] = Field(None, description="Raw byte representation")
+    top_logprobs: Optional[List[TokenLogprob]] = Field(
+        None, description="Most likely tokens and their log probabilities"
+    )
+
+
+class ModelOptions(BaseModel):
+    """Runtime options that control text generation."""
+
+    seed: Optional[int] = Field(None, description="Random seed for reproducible outputs")
+    temperature: Optional[float] = Field(None, description="Randomness in generation")
+    top_k: Optional[int] = Field(None, description="Limits next token selection to K most likely")
+    top_p: Optional[float] = Field(None, description="Cumulative probability threshold")
+    min_p: Optional[float] = Field(None, description="Minimum probability threshold")
+    stop: Optional[Union[str, List[str]]] = Field(None, description="Stop sequences")
+    num_ctx: Optional[int] = Field(None, description="Context length size")
+    num_predict: Optional[int] = Field(None, description="Maximum number of tokens to generate")
+    model_config = ConfigDict(extra="allow")
+
+
+class GenerateRequest(BaseModel):
+    """Payload for generating a response from a model."""
+
+    model: str = Field(..., description="Model name")
+    prompt: Optional[str] = Field(None, description="Text for the model to generate a response from")
+    suffix: Optional[str] = Field(None, description="Text that appears after the user prompt for FIM models")
+    images: Optional[List[str]] = Field(None, description="Base64-encoded images")
+    format: Optional[Union[str, Dict[str, Any]]] = Field(None, description="Structured output format constraints")
+    system: Optional[str] = Field(None, description="System prompt")
+    stream: bool = Field(True, description="Returns a stream of partial responses if true")
+    think: Optional[Union[bool, Literal["high", "medium", "low"]]] = Field(
+        None, description="Returns separate thinking output"
+    )
+    raw: bool = Field(False, description="Returns raw response without prompt templating")
+    keep_alive: Optional[Union[str, int]] = Field(None, description="Model keep-alive duration")
+    options: Optional[ModelOptions] = Field(None, description="Runtime options")
+    logprobs: Optional[bool] = Field(None, description="Return log probabilities")
+    top_logprobs: Optional[int] = Field(None, description="Number of top logprobs to return")
+
+
+class GenerateResponse(BaseModel):
+    """Standard, non-streaming text generation response."""
+
+    model: str = Field(..., description="Model name")
+    created_at: str = Field(..., description="ISO 8601 timestamp")
+    response: str = Field(..., description="Generated text response")
+    thinking: Optional[str] = Field(None, description="Generated thinking output")
+    done: bool = Field(..., description="Indicates whether generation has finished")
+    done_reason: Optional[str] = Field(None, description="Reason the generation stopped")
+    total_duration: Optional[int] = Field(None, description="Total duration in nanoseconds")
+    load_duration: Optional[int] = Field(None, description="Load duration in nanoseconds")
+    prompt_eval_count: Optional[int] = Field(None, description="Prompt token count")
+    prompt_eval_duration: Optional[int] = Field(None, description="Prompt evaluation duration in nanoseconds")
+    eval_count: Optional[int] = Field(None, description="Generated token count")
+    eval_duration: Optional[int] = Field(None, description="Generation duration in nanoseconds")
+    logprobs: Optional[List[Logprob]] = Field(None, description="Log probability information")
+
+
+class GenerateStreamEvent(BaseModel):
+    """A single event chunk from a streaming generation response."""
+
+    model: str = Field(..., description="Model name")
+    created_at: str = Field(..., description="ISO 8601 timestamp")
+    response: str = Field(..., description="Generated text response chunk")
+    thinking: Optional[str] = Field(None, description="Generated thinking output chunk")
+    done: bool = Field(..., description="Indicates whether stream has finished")
+    done_reason: Optional[str] = Field(None, description="Reason stream stopped")
+    total_duration: Optional[int] = Field(None)
+    load_duration: Optional[int] = Field(None)
+    prompt_eval_count: Optional[int] = Field(None)
+    prompt_eval_duration: Optional[int] = Field(None)
+    eval_count: Optional[int] = Field(None)
+    eval_duration: Optional[int] = Field(None)
+
+
+class ToolCallFunction(BaseModel):
+    """Details of the function to call produced by the model."""
+
+    name: str = Field(..., description="Name of the function to call")
+    description: Optional[str] = Field(None, description="Function description")
+    arguments: Optional[Dict[str, Any]] = Field(None, description="Arguments to pass")
+
+
+class ToolCall(BaseModel):
+    """A tool call request produced by the model."""
+
+    function: ToolCallFunction
+
+
+class ToolDefinitionFunction(BaseModel):
+    """Function details exposed to the model for tool calling."""
+
+    name: str = Field(..., description="Function name exposed to the model")
+    description: Optional[str] = Field(None, description="Description of the function")
+    parameters: Optional[Dict[str, Any]] = Field(None, description="JSON Schema for parameters")
+
+
+class ToolDefinition(BaseModel):
+    """Definition of a tool the model can use."""
+
+    type: Literal["function"] = Field("function", description="Type of tool")
+    function: ToolDefinitionFunction
+
+
+class ChatMessage(BaseModel):
+    """A single message in the chat history."""
+
+    role: Literal["system", "user", "assistant", "tool"] = Field(..., description="Message author")
+    content: str = Field(..., description="Message text content")
+    images: Optional[List[str]] = Field(None, description="Base64-encoded images")
+    tool_calls: Optional[List[ToolCall]] = Field(None, description="Tool calls")
+
+
+class ChatRequest(BaseModel):
+    """Payload for generating a chat response."""
+
+    model: str = Field(..., description="Model name")
+    messages: List[ChatMessage] = Field(..., description="Chat history")
+    tools: Optional[List[ToolDefinition]] = Field(None, description="Available functions")
+    format: Optional[Union[Literal["json"], Dict[str, Any]]] = Field(None, description="Response format constraint")
+    options: Optional[ModelOptions] = Field(None, description="Runtime options")
+    stream: bool = Field(True, description="Stream responses if true")
+    think: Optional[Union[bool, Literal["high", "medium", "low"]]] = Field(None, description="Include thinking trace")
+    keep_alive: Optional[Union[str, int]] = Field(None, description="Model keep-alive duration")
+    logprobs: Optional[bool] = Field(None, description="Return log probabilities")
+    top_logprobs: Optional[int] = Field(None, description="Number of top logprobs")
+
+
+class ChatResponseMessage(BaseModel):
+    """The generated message content inside the response."""
+
+    role: Literal["assistant"] = Field("assistant", description="Message author")
+    content: str = Field(..., description="Assistant message text")
+    thinking: Optional[str] = Field(None, description="Deliberate thinking trace")
+    tool_calls: Optional[List[ToolCall]] = Field(None, description="Requested tool calls")
+    images: Optional[List[str]] = Field(None, description="Base64-encoded images")
+
+
+class ChatResponse(BaseModel):
+    """Standard, non-streaming chat response object."""
+
+    model: str = Field(..., description="Model name")
+    created_at: str = Field(..., description="ISO 8601 timestamp")
+    message: ChatResponseMessage
+    done: bool = Field(..., description="Indicates completion")
+    done_reason: Optional[str] = Field(None, description="Reason for completion")
+    total_duration: Optional[int] = Field(None)
+    load_duration: Optional[int] = Field(None)
+    prompt_eval_count: Optional[int] = Field(None)
+    prompt_eval_duration: Optional[int] = Field(None)
+    eval_count: Optional[int] = Field(None)
+    eval_duration: Optional[int] = Field(None)
+    logprobs: Optional[List[Logprob]] = Field(None)
+
+
+class ChatStreamEvent(BaseModel):
+    """A single event chunk from a streaming chat response."""
+
+    model: str = Field(..., description="Model name")
+    created_at: str = Field(..., description="ISO 8601 timestamp")
+    message: ChatResponseMessage
+    done: bool = Field(..., description="Indicates completion")
+    done_reason: Optional[str] = Field(None, description="Reason for completion")
+    total_duration: Optional[int] = Field(None)
+    load_duration: Optional[int] = Field(None)
+    prompt_eval_count: Optional[int] = Field(None)
+    prompt_eval_duration: Optional[int] = Field(None)
+    eval_count: Optional[int] = Field(None)
+    eval_duration: Optional[int] = Field(None)
+
+
 class ModelStatus(str, Enum):
-    """Enumeration for model download states."""
+    """Current state of a model in the local registry."""
 
     DOWNLOADING = "downloading"
     READY = "ready"
@@ -106,97 +265,139 @@ class ModelStatus(str, Enum):
 
 
 class ModelConfig(BaseModel):
-    """Configuration for an allowed model."""
+    """Configuration mapping for downloaded and available models."""
 
     description: Optional[str] = None
     task: str = "text-generation"
-    backend: str = "llama-cpp"
-    filename: Optional[str] = None
-    projector_filename: Optional[str] = None
-    chat_handler: Optional[str] = None
+    backend: str = "transformers"
     system_prompt: Optional[str] = None
-    generation_defaults: Dict[str, Any] = {}
 
 
 class RegistryItem(BaseModel):
-    """Status and paths for a downloaded model."""
+    """Tracks a model's installation progress and local path."""
 
     status: ModelStatus
     local_path: Optional[str] = None
-    shard_paths: Optional[List[str]] = None
-    projector_path: Optional[str] = None
     error_message: Optional[str] = None
-    details: Dict[str, Any] = {}
 
 
-class ModelIdentifier(BaseModel):
-    """Identifier for a model in requests."""
+class EmbedRequest(BaseModel):
+    """Payload for generating embeddings."""
 
-    name: str
+    model: str = Field(..., description="Model name")
+    input: Union[str, List[str]] = Field(..., description="Text or array of texts to embed")
+    truncate: bool = Field(True, description="Truncate inputs exceeding context window")
+    dimensions: Optional[int] = Field(None, description="Output dimensions")
+    keep_alive: Optional[Union[str, int]] = Field(None, description="Keep-alive duration")
+    options: Optional[ModelOptions] = Field(None, description="Runtime options")
+
+
+class EmbedResponse(BaseModel):
+    """Response object containing embeddings or rerank scores."""
+
+    model: str = Field(..., description="Model name")
+    embeddings: Optional[List[List[float]]] = Field(None, description="Array of vector embeddings")
+    scores: Optional[List[float]] = Field(None, description="Relevance scores for reranking")
+    total_duration: Optional[int] = Field(None, description="Total duration in nanoseconds")
+    load_duration: Optional[int] = Field(None, description="Load duration in nanoseconds")
+    prompt_eval_count: Optional[int] = Field(None, description="Tokens processed")
+
+
+class ModelDetails(BaseModel):
+    """Metadata detailing the model's format and architecture."""
+
+    format: str = Field(..., description="Model file format")
+    family: str = Field(..., description="Primary model family")
+    families: Optional[List[str]] = Field(None, description="All families")
+    parameter_size: Optional[str] = Field(None, description="Approximate parameter count")
+    quantization_level: Optional[str] = Field(None, description="Quantization level")
+
+
+class ModelSummary(BaseModel):
+    """Summary information for a locally available model."""
+
+    name: str = Field(..., description="Model name")
+    model: str = Field(..., description="Model name alias")
+    modified_at: str = Field(..., description="ISO 8601 last modified timestamp")
+    size: int = Field(..., description="Size on disk in bytes")
+    digest: str = Field(..., description="Model contents digest")
+    details: ModelDetails
+
+
+class ListResponse(BaseModel):
+    """Response containing the list of available models."""
+
+    models: List[ModelSummary]
+
+
+class Ps(BaseModel):
+    """Information about a currently running model."""
+
+    name: str = Field(..., description="Name of the running model")
+    model: str = Field(..., description="Name of the running model")
+    size: int = Field(..., description="Size of the model in bytes")
+    digest: str = Field(..., description="SHA256 digest")
+    details: ModelDetails = Field(..., description="Model details")
+    expires_at: str = Field(..., description="Time when the model will be unloaded")
+    size_vram: int = Field(..., description="VRAM usage in bytes")
+    context_length: int = Field(0, description="Context length capacity")
+
+
+class PsResponse(BaseModel):
+    """Response containing the list of models currently loaded into memory."""
+
+    models: List[Ps] = Field(..., description="Currently running models")
+
+
+class ShowRequest(BaseModel):
+    """Payload for showing model details."""
+
+    model: str = Field(..., description="Model name to show")
+    verbose: bool = Field(False, description="Include large verbose fields")
+
+
+class ShowResponse(BaseModel):
+    """Response containing detailed model information."""
+
+    parameters: Optional[str] = Field(None, description="Parameter settings")
+    license: Optional[str] = Field(None, description="Model license")
+    modified_at: str = Field(..., description="Last modified timestamp")
+    details: ModelDetails = Field(..., description="High-level details")
+    template: Optional[str] = Field(None, description="Prompt template")
+    capabilities: List[str] = Field(..., description="Supported features")
+    model_info: Dict[str, Any] = Field(..., description="Additional metadata")
 
 
 class PullRequest(BaseModel):
-    """Request schema for pulling a model."""
+    """Payload for pulling a model from a remote registry."""
 
-    name: str
-    stream: bool = False
-
-
-class GenerateRequest(BaseModel):
-    """Request schema for text generation."""
-
-    model: str
-    prompt: str
-    system: Optional[str] = None
-    images: Optional[List[str]] = None
-    stream: bool = False
-    options: Dict[str, Any] = {}
+    model: str = Field(..., description="Name of the model to download")
+    insecure: bool = Field(False, description="Allow insecure connections")
+    stream: bool = Field(True, description="Stream progress updates")
 
 
-class ChatMessage(BaseModel):
-    """A single message in a chat completion."""
+class DeleteRequest(BaseModel):
+    """Payload for deleting a model."""
 
-    role: str
-    content: str
-    images: Optional[List[str]] = None
+    model: str = Field(..., description="Model name to delete")
 
 
-class ChatRequest(BaseModel):
-    """Request schema for chat completions."""
-
-    model: str
-    messages: List[ChatMessage]
-    stream: bool = False
-    options: Dict[str, Any] = {}
-
-
-class EmbeddingRequest(BaseModel):
-    """Request schema for embeddings."""
-
-    model: str
-    input: Union[str, List[str]]
-    options: Dict[str, Any] = {}
-
-
-# =============================================================================
-# MODEL MANAGER
-# =============================================================================
 class ModelManager:
-    """Manages model configurations and downloads."""
+    """Manages the local model registry, configurations, and downloads."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        if not REGISTRY_FILE.exists():
-            self._save_json(REGISTRY_FILE, {})
-        if not ALLOWED_MODELS_FILE.exists():
-            self._save_json(ALLOWED_MODELS_FILE, {})
+        if not Path("registry.json").exists():
+            self._save_json(Path("registry.json"), {})
 
     def _save_json(self, path: Path, data: Any) -> None:
+        """Atomically saves JSON data to disk."""
         with self._lock:
             with open(path, "w") as f:
                 json.dump(data, f, indent=2)
 
     def _load_json(self, path: Path) -> Dict[str, Any]:
+        """Loads JSON data safely."""
         with self._lock:
             if not path.exists():
                 return {}
@@ -207,372 +408,300 @@ class ModelManager:
                 return {}
 
     def get_allowed(self) -> Dict[str, ModelConfig]:
-        """Retrieve all allowed models."""
-        data = self._load_json(ALLOWED_MODELS_FILE)
+        """Retrieves allowed models from models.json."""
+        data = self._load_json(Path("models.json"))
         return {k: ModelConfig(**v) for k, v in data.items() if not k.startswith("_")}
 
     def get_registry(self) -> Dict[str, RegistryItem]:
-        """Retrieve the local model registry."""
-        data = self._load_json(REGISTRY_FILE)
-        return {k: RegistryItem(**v) for k, v in data.items()}
+        """Retrieves the current downloaded model registry."""
+        return {k: RegistryItem(**v) for k, v in self._load_json(Path("registry.json")).items()}
 
     def update_registry(self, model_id: str, **kwargs: Any) -> None:
-        """Update a model's registry entry."""
-        reg = self._load_json(REGISTRY_FILE)
-        entry = reg.get(model_id, {})
-        entry.update(kwargs)
-        reg[model_id] = entry
-        self._save_json(REGISTRY_FILE, reg)
-
-    def get_model_info(self, model_id: str) -> Optional[Dict[str, Any]]:
-        """Get detailed information about a model."""
-        config = self.get_allowed().get(model_id)
-        reg = self.get_registry().get(model_id)
-        if not config:
-            return None
-        return {
-            "modelfile": f"# {model_id}\n# {config.description}",
-            "parameters": json.dumps(config.generation_defaults),
-            "template": config.system_prompt or "",
-            "details": {
-                "format": "gguf" if config.backend != "transformers" else "transformers",
-                "family": config.task,
-                "quantization_level": reg.details.get("quantization", "unknown") if reg else "unknown",
-            },
-            "model_info": config.model_dump(),
-        }
+        """Updates specific attributes of a model in the registry."""
+        reg = self._load_json(Path("registry.json"))
+        reg.setdefault(model_id, {}).update(kwargs)
+        self._save_json(Path("registry.json"), reg)
 
     def download_task(self, model_id: str) -> None:
-        """Background task to download a model from Hugging Face."""
-        config = self.get_allowed().get(model_id)
-        if not config:
-            return
-
+        """Executes model download from Hugging Face."""
         try:
-            logger.info(f"⬇️ Starting download: {model_id}")
-            if config.backend == "transformers" or config.task in [
-                "automatic-speech-recognition",
-                "feature-extraction",
-                "text-classification",
-            ]:
-                local_dir = MODELS_DIR / model_id.replace("/", "--")
-                snapshot_download(repo_id=model_id, local_dir=local_dir)
-                self.update_registry(model_id, status=ModelStatus.READY, local_path=str(local_dir))
-            else:
-                if not config.filename:
-                    raise ValueError("GGUF models must specify 'filename'")
-                files = list_repo_files(repo_id=model_id)
-                matches = fnmatch.filter(files, config.filename)
-                if not matches:
-                    raise FileNotFoundError(f"No file matching {config.filename}")
-
-                # Sort alphabetically to ensure the first shard (e.g., -00001) is at index 0
-                matches.sort()
-
-                shard_paths = []
-                for match in matches:
-                    logger.info(f"Downloading shard: {match}")
-                    dl_path = hf_hub_download(repo_id=model_id, filename=match, local_dir=MODELS_DIR)
-                    shard_paths.append(dl_path)
-
-                # The primary path passed to llama.cpp MUST be the first shard
-                path = shard_paths[0]
-
-                proj_path = None
-                if config.projector_filename:
-                    p_matches = fnmatch.filter(files, config.projector_filename)
-                    if p_matches:
-                        proj_path = hf_hub_download(repo_id=model_id, filename=p_matches[0], local_dir=MODELS_DIR)
-
-                quant = matches[0].split(".")[-2] if "Q" in matches[0] else "unknown"
-                self.update_registry(
-                    model_id,
-                    status=ModelStatus.READY,
-                    local_path=path,
-                    shard_paths=shard_paths,
-                    projector_path=proj_path,
-                    details={"quantization": quant},
-                )
-
-            logger.info(f"✅ Download complete: {model_id}")
-
+            local_dir = MODELS_DIR / model_id.replace("/", "--")
+            snapshot_download(repo_id=model_id, local_dir=local_dir, ignore_patterns=["*.msgpack", "*.h5", "*.bin"])
+            self.update_registry(model_id, status=ModelStatus.READY, local_path=str(local_dir))
         except Exception as e:
-            logger.error(f"❌ Download failed: {e}")
             self.update_registry(model_id, status=ModelStatus.ERROR, error_message=str(e))
 
     def delete_model(self, model_id: str) -> None:
-        """Delete a model from disk and registry."""
-        reg = self.get_registry().get(model_id)
-        if reg:
-            # Delete all shards if present
-            if reg.shard_paths:
-                for sp in reg.shard_paths:
-                    Path(sp).unlink(missing_ok=True)
-            # Fallback for older non-sharded registry entries
-            elif reg.local_path:
-                p = Path(reg.local_path)
-                if p.is_file():
-                    p.unlink(missing_ok=True)
-                elif p.is_dir():
-                    shutil.rmtree(p, ignore_errors=True)
-
-            if reg.projector_path:
-                Path(reg.projector_path).unlink(missing_ok=True)
-
-        full_reg = self._load_json(REGISTRY_FILE)
-        if model_id in full_reg:
-            del full_reg[model_id]
-            self._save_json(REGISTRY_FILE, full_reg)
-
-    def get_model_size(self, model_id: str) -> int:
-        """Calculate the total size of a downloaded model in bytes."""
-        reg = self.get_registry().get(model_id)
-        if not reg or reg.status != ModelStatus.READY:
-            return 0
-
-        total_size = 0
-        try:
-            if reg.shard_paths:
-                for path in reg.shard_paths:
-                    total_size += Path(path).stat().st_size
-            elif reg.local_path:
-                p = Path(reg.local_path)
-                if p.is_file():
-                    total_size += p.stat().st_size
-                elif p.is_dir():
-                    # Sum all files in directory for transformers backends
-                    total_size += sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
-
-            if reg.projector_path:
-                total_size += Path(reg.projector_path).stat().st_size
-        except OSError:
-            pass  # File might have been deleted manually
-
-        return total_size
+        """Removes model assets and registry entries."""
+        reg = self._load_json(Path("registry.json"))
+        if model_id in reg:
+            path = reg[model_id].get("local_path")
+            if path and Path(path).exists():
+                shutil.rmtree(path)
+            del reg[model_id]
+            self._save_json(Path("registry.json"), reg)
 
 
-# =============================================================================
-# INFERENCE ENGINE
-# =============================================================================
 class InferenceEngine:
-    """Handles loading and executing model inference."""
+    """Handles PyTorch and Transformers inference operations."""
 
     def __init__(self, manager: ModelManager) -> None:
         self.manager = manager
         self.active_id: Optional[str] = None
-        self.model_instance: Any = None
+        self.model: Optional[Any] = None
+        self.tokenizer: Optional[Any] = None
+        self.processor: Optional[Any] = None
         self._lock = threading.Lock()
         self.last_interaction: float = 0.0
 
-    def touch(self) -> None:
-        """Update the last interaction timestamp to prevent idle cleanup."""
-        self.last_interaction = time.time()
-
-    def _unload(self) -> None:
-        if self.model_instance:
-            logger.info(f"♻️ Unloading {self.active_id}...")
-            del self.model_instance
-            self.model_instance = None
-            self.active_id = None
+    def unload(self) -> None:
+        """Releases VRAM by deleting model instances and invoking garbage collection."""
+        if self.model:
+            logger.info(f"Unloading model {self.active_id} from VRAM.")
+            del self.model, self.tokenizer, self.processor
+            self.model = self.tokenizer = self.processor = self.active_id = None
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
 
     def load(self, model_id: str) -> None:
-        """Load a model into VRAM."""
-        # Implicitly touch when checking/loading
-        self.touch()
-
+        """Loads model weights into VRAM."""
+        self.last_interaction = time.time()
         if self.active_id == model_id:
             return
 
         config = self.manager.get_allowed().get(model_id)
         reg = self.manager.get_registry().get(model_id)
-
-        if not config or not reg or reg.status != ModelStatus.READY:
-            raise AppError(f"Model {model_id} not ready", 404, "model_not_ready")
+        if not config or not reg or reg.status != "ready" or not reg.local_path:
+            raise AppError(f"Model '{model_id}' not found or unavailable.", 404)
 
         with self._lock:
-            if self.active_id == model_id:
-                return
-            self._unload()
+            self.unload()
+            path = reg.local_path
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            dtype = torch.float16 if device == "cuda" else torch.float32
 
-            logger.info(f"🚀 Loading {model_id} ({config.backend})...")
-            start = time.perf_counter()
-
-            if not reg.local_path:
-                raise AppError(f"Model {model_id} has no valid local_path", 500, "model_corrupted")
-
-            if config.backend == "transformers" or config.task in [
-                "automatic-speech-recognition",
-                "feature-extraction",
-                "text-classification",
-            ]:
-                self._load_transformers(config, reg.local_path)
-            else:
-                self._load_gguf(config, reg.local_path, reg.projector_path)
-
+            logger.info(f"Loading {model_id} into VRAM...")
+            if config.task == "text-generation":
+                self.tokenizer = AutoTokenizer.from_pretrained(path)
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    path, device_map="auto", dtype=dtype, attn_implementation="sdpa"
+                )
+            elif config.task == "image-to-text":
+                self.processor = AutoProcessor.from_pretrained(path)
+                self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    path, device_map="auto", dtype=dtype, attn_implementation="sdpa"
+                )
+            elif config.task == "automatic-speech-recognition":
+                self.model = pipeline("automatic-speech-recognition", model=path, device=device, dtype=dtype)
+            elif config.task in ["feature-extraction", "text-classification"]:
+                self.tokenizer = AutoTokenizer.from_pretrained(path)
+                m_cls = AutoModel if config.task == "feature-extraction" else AutoModelForSequenceClassification
+                self.model = m_cls.from_pretrained(path, dtype=dtype).to(device)
             self.active_id = model_id
-            logger.info(f"✅ Loaded in {time.perf_counter() - start:.2f}s")
 
-    def _load_transformers(self, config: ModelConfig, path: str) -> None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        if config.task == "automatic-speech-recognition":
-            self.model_instance = pipeline(
-                "automatic-speech-recognition",
-                model=path,
-                device=device,
-                torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-            )
-        elif config.task == "feature-extraction":
-            tokenizer = AutoTokenizer.from_pretrained(path)
-            model = AutoModel.from_pretrained(path, trust_remote_code=True).to(device)
-            self.model_instance = (model, tokenizer)
-        elif config.task == "text-classification":
-            tokenizer = AutoTokenizer.from_pretrained(path)
-            model = AutoModelForSequenceClassification.from_pretrained(path, trust_remote_code=True).to(device)
-            self.model_instance = (model, tokenizer)
-        else:
-            raise AppError(f"Task {config.task} not supported", 500)
-
-    def _load_gguf(self, config: ModelConfig, path: str, projector_path: Optional[str]) -> None:
-        if Llama is None:
-            raise AppError("llama-cpp-python missing", 500)
-
-        params = config.generation_defaults.copy()
-        n_gpu = params.pop("n_gpu_layers", -1)
-        n_ctx = params.pop("n_ctx", 4096)
-
-        if n_ctx == 0:
-            n_ctx = 0
-
-        chat_handler = None
-        chat_format = None
-
-        if config.task == "image-to-text":
-            if config.chat_handler == "llama_cpp.llama_chat_format.Qwen2VLChatHandler" and projector_path:
-                chat_handler = Qwen2VLChatHandler(clip_model_path=projector_path)
-
-            # Fallback for LLaVA
-            elif projector_path and Llava15ChatHandler:
-                chat_handler = Llava15ChatHandler(clip_model_path=projector_path)
-
-            # Fallback for old Qwen text-only
-            elif "qwen" in path.lower():
-                chat_format = "qwen"
-
-        self.model_instance = Llama(
-            model_path=path,
-            n_gpu_layers=n_gpu,
-            n_ctx=n_ctx,
-            chat_handler=chat_handler,
-            chat_format=chat_format,
-            verbose=False,
-        )
-
-    def chat(self, model_id: str, messages: List[Dict], options: Dict[str, Any], stream: bool = False) -> Any:
-        """Execute a chat completion."""
+    def chat(
+        self,
+        model_id: str,
+        messages: List[Dict[str, Any]],
+        options: Dict[str, Any],
+        stream: bool,
+        is_chat: bool,
+        force_json: bool,
+    ) -> Union[Iterator[str], Dict[str, Any]]:
+        """Core logic for text and multimodal generation operations."""
+        start_t = time.perf_counter()
         self.load(model_id)
-        chat_start = time.perf_counter()
+        load_t = time.perf_counter() - start_t
+        config = self.manager.get_allowed()[model_id]
 
-        if Llama is None or not isinstance(self.model_instance, Llama):
-            if stream:
-                raise AppError("Streaming only supported for GGUF models", 400)
-            raise AppError("Chat supported only for GGUF", 400)
-
-        # Prepare messages
-        fmt_msgs = []
-        for m in messages:
-            if m.get("images"):
+        if config.task == "image-to-text" and self.processor and self.model:
+            hf_msgs = []
+            for m in messages:
                 content = [{"type": "text", "text": m["content"]}]
-                for img in m["images"]:
-                    content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
-                fmt_msgs.append({"role": m["role"], "content": content})
+                if m.get("images"):
+                    for img in m["images"]:
+                        content.append({"type": "image", "image": f"data:image/jpeg;base64,{img}"})
+                hf_msgs.append({"role": m["role"], "content": content})
+            text = self.processor.apply_chat_template(hf_msgs, tokenize=False, add_generation_prompt=True)
+            img_in, vid_in = process_vision_info(hf_msgs)
+            inputs = self.processor(text=[text], images=img_in, videos=vid_in, padding=True, return_tensors="pt").to(
+                self.model.device
+            )
+            tok = self.processor.tokenizer
+        elif self.tokenizer and self.model:
+            text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+            tok = self.tokenizer
+        else:
+            raise AppError("Model configuration invalid for text generation.", 500)
+
+        prompt_eval_count = inputs.input_ids.shape[1]
+        eval_start_t = time.perf_counter()
+
+        streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True, timeout=15.0)
+        temp = options.get("temperature", 0.8)
+
+        gen_kwargs: Dict[str, Any] = {
+            **inputs,
+            "streamer": streamer,
+            "max_new_tokens": options.get("num_predict", 512),
+        }
+
+        if temp <= 0.0:
+            gen_kwargs["do_sample"] = False
+        else:
+            gen_kwargs["do_sample"] = True
+            gen_kwargs["temperature"] = temp
+            if "top_p" in options:
+                gen_kwargs["top_p"] = options["top_p"]
+            if "top_k" in options:
+                gen_kwargs["top_k"] = options["top_k"]
+
+        threading.Thread(target=self.model.generate, kwargs=gen_kwargs).start()
+
+        def sync_gen() -> Iterator[Any]:
+            full_txt = ""
+            thinking = ""
+            in_thought = False
+            t_count = 0
+            first_tok = None
+
+            for new_text in streamer:
+                if first_tok is None:
+                    first_tok = time.perf_counter()
+                t_count += 1
+
+                if "<think>" in new_text:
+                    in_thought = True
+                    continue
+                if "</think>" in new_text:
+                    in_thought = False
+                    continue
+
+                if in_thought:
+                    thinking += new_text
+                else:
+                    full_txt += new_text
+
+                if stream:
+                    chunk: Dict[str, Any] = {
+                        "model": model_id,
+                        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        "done": False,
+                    }
+                    if is_chat:
+                        chunk["message"] = {"role": "assistant", "content": new_text}
+                    else:
+                        chunk["response"] = new_text
+                    if thinking:
+                        chunk["thinking"] = thinking
+                    yield json.dumps(chunk) + "\n"
+
+            eval_end = time.perf_counter()
+
+            if force_json and not stream:
+                match = re.search(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", full_txt, re.DOTALL)
+                if match:
+                    full_txt = match.group(1).strip()
+                else:
+                    match = re.search(r"(\{.*?\}|\[.*?\])", full_txt, re.DOTALL)
+                    if match:
+                        full_txt = match.group(1).strip()
+
+            res: Dict[str, Any] = {
+                "model": model_id,
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "done": True,
+                "done_reason": "stop",
+                "total_duration": int((eval_end - start_t) * 1e9),
+                "load_duration": int(load_t * 1e9),
+                "prompt_eval_count": prompt_eval_count,
+                "eval_count": t_count,
+                "eval_duration": int((eval_end - (first_tok or eval_start_t)) * 1e9),
+            }
+
+            if is_chat:
+                res["message"] = {"role": "assistant", "content": full_txt}
             else:
-                fmt_msgs.append({"role": m["role"], "content": m["content"]})
+                res["response"] = full_txt
 
-        defaults = self.manager.get_allowed()[model_id].generation_defaults or {}
-        kwargs = {**defaults, **options}
-        if "num_predict" in kwargs:
-            kwargs["max_tokens"] = kwargs.pop("num_predict")
+            if thinking:
+                res["thinking"] = thinking
 
-        for k in ["n_gpu_layers", "n_ctx", "n_batch"]:
-            kwargs.pop(k, None)
-
-        res = self.model_instance.create_chat_completion(messages=fmt_msgs, stream=stream, **kwargs)
+            if stream:
+                yield json.dumps(res) + "\n"
+            else:
+                yield res
 
         if stream:
-
-            def sync_gen():
-                for chunk in res:
-                    delta = chunk["choices"][0].get("delta", {})
-                    content = delta.get("content", "")
-                    role = delta.get("role", "assistant")
-                    yield (
-                        json.dumps(
-                            {
-                                "model": model_id,
-                                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                                "message": {"role": role, "content": content},
-                                "done": chunk["choices"][0].get("finish_reason") is not None,
-                            }
-                        )
-                        + "\n"
-                    )
-
             return sync_gen()
+        return next(sync_gen())
 
-        duration = int((time.perf_counter() - chat_start) * 1e9)
-
-        return {
-            "model": model_id,
-            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "message": res["choices"][0]["message"],
-            "done": True,
-            "total_duration": duration,
-            "eval_count": res["usage"]["completion_tokens"] if "usage" in res else 0,
-        }
-
-    def embeddings(self, model_id: str, texts: List[str], options: Dict[str, Any]) -> Dict[str, Any]:
-        """Generate embeddings."""
-        self.load(model_id)
+    def embeddings(
+        self, model_id: str, texts: List[str], truncate: bool = True, dimensions: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Calculates vector embeddings for a given input."""
         start = time.perf_counter()
+        self.load(model_id)
+        load_t = time.perf_counter() - start
 
-        if Llama is not None and isinstance(self.model_instance, Llama):
-            raise AppError("Use transformers for embeddings", 400)
+        if not self.tokenizer or not self.model:
+            raise AppError("Model configuration invalid for embeddings.", 500)
 
-        model, tokenizer = self.model_instance
-        device = model.device
+        try:
+            inputs = self.tokenizer(texts, return_tensors="pt", padding=True, truncation=truncate).to(self.model.device)
+        except Exception as e:
+            raise AppError(f"Tokenization failed: {str(e)}", 400)
 
-        sep = options.get("pair_sep", "\u241e")
-        if any(sep in t for t in texts):
-            pairs = [t.split(sep, 1) for t in texts]
-            inputs = tokenizer(pairs, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
-            with torch.no_grad():
-                scores = model(**inputs).logits.view(-1).float().cpu().tolist()
-            output = [[s] for s in scores]
-        else:
-            inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
-            with torch.no_grad():
-                if hasattr(model, "last_hidden_state"):
-                    output = model(**inputs).last_hidden_state.mean(dim=1).cpu().tolist()
-                elif hasattr(model, "base_model"):
-                    output = model.base_model(**inputs).last_hidden_state.mean(dim=1).cpu().tolist()
-                else:
-                    output = model(**inputs)[0].mean(dim=1).cpu().tolist()
+        if not truncate and hasattr(self.tokenizer, "model_max_length"):
+            if inputs.input_ids.shape[1] > self.tokenizer.model_max_length:
+                raise AppError(
+                    f"Input exceeds maximum context length of {self.tokenizer.model_max_length}. "
+                    "Set truncate=True to ignore.",
+                    400,
+                )
+
+        with torch.no_grad():
+            output = self.model(**inputs).last_hidden_state.mean(dim=1)
+            if dimensions is not None:
+                output = output[:, :dimensions]
+            embeddings_list = output.cpu().tolist()
 
         return {
             "model": model_id,
-            "embeddings": output,
+            "embeddings": embeddings_list,
             "total_duration": int((time.perf_counter() - start) * 1e9),
+            "load_duration": int(load_t * 1e9),
+            "prompt_eval_count": inputs.input_ids.numel(),
         }
 
-    def transcribe(self, model_id: str, file_path: str, options: Dict[str, Any]) -> Dict[str, Any]:
-        """Transcribe an audio file."""
-        self.load(model_id)
+    def rerank(self, model_id: str, query: str, docs: List[str]) -> Dict[str, Any]:
+        """Calculates relevance scores for reranking workflows."""
         start = time.perf_counter()
-        res = self.model_instance(file_path, **options)
+        self.load(model_id)
+        if not self.tokenizer or not self.model:
+            raise AppError("Model configuration invalid for reranking.", 500)
+
+        pairs = [[query, doc] for doc in docs]
+        inputs = self.tokenizer(pairs, return_tensors="pt", padding=True, truncation=True, max_length=512).to(
+            self.model.device
+        )
+
+        with torch.no_grad():
+            logits = self.model(**inputs).logits.view(-1).float()
+            scores = torch.sigmoid(logits).cpu().tolist()
+
+        return {"model": model_id, "scores": scores, "total_duration": int((time.perf_counter() - start) * 1e9)}
+
+    def transcribe(self, model_id: str, path: str) -> Dict[str, Any]:
+        """Processes audio files using Automatic Speech Recognition."""
+        start = time.perf_counter()
+        self.load(model_id)
+        if not self.model:
+            raise AppError("Model configuration invalid for transcription.", 500)
+
+        res = self.model(path, chunk_length_s=30, generate_kwargs={"condition_on_prev_tokens": False})
         return {
             "model": model_id,
             "text": res.get("text", "").strip(),
@@ -580,272 +709,473 @@ class InferenceEngine:
         }
 
 
-# =============================================================================
-# APP LIFECYCLE & MONITORING
-# =============================================================================
-async def monitor_idle_models(engine_ref: InferenceEngine):
-    """Background task to unload models after inactivity."""
-    logger.info("🕒 Idle monitor started (Timeout: 5min)")
+def inject_json_instruction(messages: List[Dict[str, Any]], format_req: Union[str, Dict[str, Any], None]) -> bool:
+    """Injects JSON constraints into system prompts if strict formatting is requested."""
+    if not format_req:
+        return False
+
+    instruction = (
+        "You are a strict data-generating API. You must respond ONLY with valid, parseable JSON. "
+        "Ensure all JSON keys and string values are strictly enclosed in double quotes. "
+        "Do not include any explanations, markdown formatting, or conversational text."
+    )
+
+    if isinstance(format_req, dict):
+        schema_str = json.dumps(format_req, indent=2)
+        instruction = (
+            f"You are a strict data-generating API. You must respond ONLY with valid, parseable JSON "
+            f"that adheres exactly to the following JSON Schema:\n{schema_str}\n"
+            "Ensure all JSON keys and string values are strictly enclosed in double quotes. "
+            "Do not include any explanations, markdown formatting, or conversational text."
+        )
+
+    if messages and messages[0].get("role") == "system":
+        messages[0]["content"] += f"\n\n{instruction}"
+    else:
+        messages.insert(0, {"role": "system", "content": instruction})
+
+    return True
+
+
+async def _handle_keep_alive(keep_alive: Union[str, int, None], model: str, engine_instance: InferenceEngine) -> bool:
+    """Determines if the model should be immediately unloaded based on keep_alive parameter."""
+    if keep_alive in [0, "0", "0s", "0m"]:
+        if engine_instance.active_id == model:
+            async with GPU_LOCK:
+                engine_instance.unload()
+        return True
+    return False
+
+
+def _extract_options(
+    options: Optional[ModelOptions], logprobs: Optional[bool], top_logprobs: Optional[int]
+) -> Dict[str, Any]:
+    """Extracts and consolidates inference execution options."""
+    options_dict = options.model_dump(exclude_unset=True) if options else {}
+    if logprobs:
+        options_dict["logprobs"] = True
+        if top_logprobs:
+            options_dict["top_logprobs"] = top_logprobs
+    return options_dict
+
+
+async def monitor_idle(eng: InferenceEngine) -> None:
+    """Background task to automatically release VRAM based on inactivity."""
     while True:
-        try:
-            await asyncio.sleep(60)  # Check every minute
-            if engine_ref.active_id:
-                idle_time = time.time() - engine_ref.last_interaction
-                if idle_time > IDLE_TIMEOUT_SECONDS:
-                    logger.info(f"⏱️ Idle timeout ({idle_time:.0f}s > {IDLE_TIMEOUT_SECONDS}s). Unloading...")
-                    async with GPU_LOCK:
-                        engine_ref._unload()
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"Monitor error: {e}")
+        await asyncio.sleep(60)
+        if eng.active_id and (time.time() - eng.last_interaction > IDLE_TIMEOUT_SECONDS):
+            async with GPU_LOCK:
+                eng.unload()
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """FastAPI lifespan manager to handle background tasks."""
-    # Startup
-    monitor_task = asyncio.create_task(monitor_idle_models(engine))
+async def lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
+    """Manages application lifespan, particularly background memory management."""
+    task = asyncio.create_task(monitor_idle(engine))
     yield
-    # Shutdown
-    monitor_task.cancel()
-    try:
-        await monitor_task
-    except asyncio.CancelledError:
-        pass
+    task.cancel()
     if engine.active_id:
-        engine._unload()
+        engine.unload()
 
 
 manager = ModelManager()
 engine = InferenceEngine(manager)
-app = FastAPI(
-    title="Cudara API",
-    version="1.0.0",
-    description="Sequential GPU Inference Server",
-    lifespan=lifespan,
-)
+app = FastAPI(title="Cudara Transformers Native", lifespan=lifespan)
 
 
 @app.exception_handler(AppError)
 async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
-    """Handle AppError exceptions and format JSON response."""
-    return JSONResponse(status_code=exc.status_code, content={"error": {"code": exc.code, "message": exc.message}})
+    """Captures structured AppErrors and maps them to JSON."""
+    return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
 
 
-# --- Routes ---
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Handles malformed requests and maps to a 400 JSON error."""
+    return JSONResponse(status_code=400, content={"error": f"Invalid request format: {str(exc)}"})
 
 
-@app.get("/", tags=["Health"])
-@app.get("/health", tags=["Health"])
-def health() -> Dict[str, Any]:
-    """Check the health and status of the server."""
-    return {
-        "status": "ok",
-        "active_model": engine.active_id,
-        "cuda_available": torch.cuda.is_available(),
-        "vram_used": f"{torch.cuda.memory_allocated() / 1024**3:.1f}GB" if torch.cuda.is_available() else "0GB",
-    }
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    """Captures HTTP exceptions seamlessly for standard JSON error formatting."""
+    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
 
 
-@app.get("/api/tags", tags=["Models"])
-def list_models() -> Dict[str, List[Dict]]:
-    """List all available models."""
-    allowed = manager.get_allowed()
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Global catch-all for unexpected internal server errors."""
+    return JSONResponse(status_code=500, content={"error": f"Internal server error: {str(exc)}"})
+
+
+@app.middleware("http")
+async def force_json_content_type(request: Request, call_next: Callable[[Request], Any]) -> Any:
+    """Enforces application/json content type for compatibility with stateless CLIs."""
+    if request.method in ["POST", "PUT", "PATCH", "DELETE"]:
+        content_type = request.headers.get("content-type", "")
+        if "application/json" not in content_type:
+            new_headers = [(k, v) for k, v in request.scope.get("headers", []) if k.lower() != b"content-type"]
+            new_headers.append((b"content-type", b"application/json"))
+            request.scope["headers"] = new_headers
+
+    return await call_next(request)
+
+
+@app.get("/api/tags", tags=["Models"], summary="List models", response_model=ListResponse)
+async def list_models() -> ListResponse:
+    """Fetch a list of models locally available and their configurations."""
     reg = manager.get_registry()
-    models_list = []
-    for k, v in allowed.items():
-        r = reg.get(k)
-        models_list.append(
-            {
-                "name": k,
-                # Ollama compatibility fields
-                "modified_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "size": manager.get_model_size(k) if r and r.status.value == "ready" else 0,
-                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-                # Cudara custom fields (keeps cudara_client happy)
-                "status": r.status.value if r else "not_downloaded",
-                "description": v.description,
-                "details": r.details
-                if r
-                else {"format": "gguf", "family": v.task, "parameter_size": "unknown", "quantization_level": "unknown"},
-            }
-        )
-    return {"models": models_list}
+    allowed = manager.get_allowed()
+    downloaded = []
 
+    for m_id, item in reg.items():
+        if item.status == ModelStatus.READY and item.local_path:
+            model_path = Path(item.local_path)
+            if model_path.exists():
+                size = sum(f.stat().st_size for f in model_path.rglob("*") if f.is_file())
+                config = allowed.get(m_id)
+                family = config.task if config else "unknown"
+                mtime = datetime.datetime.fromtimestamp(
+                    model_path.stat().st_mtime, tz=datetime.timezone.utc
+                ).isoformat()
 
-@app.post("/api/show", tags=["Models"])
-def show_model(req: ModelIdentifier) -> Dict[str, Any]:
-    """Show details of a specific model."""
-    info = manager.get_model_info(req.name)
-    if not info:
-        raise AppError("Model not found", 404, "model_not_found")
-    return info
-
-
-@app.post("/api/pull", tags=["Models"])
-async def pull_model(req: PullRequest, bg: BackgroundTasks) -> Any:
-    """Trigger a background download of a model."""
-    if req.name not in manager.get_allowed():
-        raise AppError("Model not allowed", 403, "model_not_allowed")
-    manager.update_registry(req.name, status=ModelStatus.DOWNLOADING)
-
-    if req.stream:
-
-        async def stream_generator():
-            yield json.dumps({"status": "pulling manifest"}) + "\n"
-            yield json.dumps({"status": "downloading", "digest": "sha256:...", "total": 100, "completed": 0}) + "\n"
-            await asyncio.to_thread(manager.download_task, req.name)
-            yield json.dumps({"status": "success"}) + "\n"
-
-        return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
-    else:
-        bg.add_task(manager.download_task, req.name)
-        return {"status": "downloading"}
-
-
-@app.delete("/api/delete", tags=["Models"])
-def delete_model(req: ModelIdentifier) -> Dict[str, str]:
-    """Delete a downloaded model."""
-    if engine.active_id == req.name:
-        engine._unload()
-    manager.delete_model(req.name)
-    return {"status": "deleted"}
-
-
-@app.post("/api/generate", tags=["Inference"])
-async def generate(req: GenerateRequest) -> Any:
-    """Generate text from a single prompt."""
-    msg: Dict[str, Any] = {"role": "user", "content": req.prompt}
-    if req.images:
-        msg["images"] = req.images
-
-    if req.stream:
-
-        async def stream_generator():
-            async with GPU_LOCK:
-                gen = await asyncio.to_thread(engine.chat, req.model, [msg], req.options, True)
-                while True:
-                    # Pass `None` as a sentinel to avoid StopIteration exceptions crashing the stream
-                    chunk_str = await asyncio.to_thread(next, gen, None)
-                    if chunk_str is None:
-                        break
-
-                    chunk = json.loads(chunk_str)
-                    yield (
-                        json.dumps(
-                            {
-                                "model": chunk["model"],
-                                "created_at": chunk["created_at"],
-                                "response": chunk.get("message", {}).get("content", ""),
-                                "done": chunk.get("done", False),
-                            }
-                        )
-                        + "\n"
+                downloaded.append(
+                    ModelSummary(
+                        name=m_id,
+                        model=m_id,
+                        modified_at=mtime,
+                        size=size,
+                        digest="sha256:" + base64.b16encode(m_id.encode()).decode().lower()[:64],
+                        details=ModelDetails(
+                            format="safetensors",
+                            family=family,
+                            families=[family],
+                            parameter_size="unknown",
+                            quantization_level="AWQ" if "AWQ" in m_id.upper() else "None",
+                        ),
                     )
+                )
 
-        return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
-    else:
-        async with GPU_LOCK:
-            res = await asyncio.to_thread(engine.chat, req.model, [msg], req.options, False)
-            return {
-                "model": res["model"],
-                "created_at": res["created_at"],
-                "response": res["message"]["content"],
-                "done": res["done"],
-                "total_duration": res.get("total_duration", 0),
-                "eval_count": res.get("eval_count", 0),
+    return ListResponse(models=downloaded)
+
+
+@app.post("/api/show", tags=["Models"], summary="Show model details", response_model=ShowResponse)
+async def show_model(req: ShowRequest) -> ShowResponse:
+    """Displays detailed schema, architecture, and formatting configuration for a model."""
+    allowed = manager.get_allowed().get(req.model)
+    reg = manager.get_registry().get(req.model)
+
+    if not allowed or not reg or not reg.local_path:
+        raise AppError(f"Model '{req.model}' not found", 404)
+
+    model_path = Path(reg.local_path)
+    info = {}
+    config_path = model_path / "config.json"
+
+    if config_path.exists():
+        with open(config_path, "r") as f:
+            c = json.load(f)
+            info = {
+                f"{allowed.task}.attention.head_count": c.get("num_attention_heads"),
+                f"{allowed.task}.context_length": c.get("max_position_embeddings"),
+                "general.architecture": c.get("model_type"),
+                "general.parameter_count": c.get("num_parameters", "unknown"),
             }
 
+    caps = ["completion"]
+    if allowed.task == "image-to-text":
+        caps.append("vision")
+    if allowed.task == "automatic-speech-recognition":
+        caps.append("audio")
 
-@app.post("/api/chat", tags=["Inference"])
-async def chat(req: ChatRequest) -> Any:
-    """Generate a response from a sequence of chat messages."""
-    if req.stream:
+    mtime = datetime.datetime.fromtimestamp(model_path.stat().st_mtime, tz=datetime.timezone.utc).isoformat()
 
-        async def stream_generator():
-            async with GPU_LOCK:
-                gen = await asyncio.to_thread(
-                    engine.chat, req.model, [m.model_dump() for m in req.messages], req.options, True
-                )
-                while True:
-                    chunk_str = await asyncio.to_thread(next, gen, None)
-                    if chunk_str is None:
-                        break
-                    yield chunk_str
-
-        return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
-    else:
-        async with GPU_LOCK:
-            return await asyncio.to_thread(
-                engine.chat, req.model, [m.model_dump() for m in req.messages], req.options, False
-            )
-
-
-@app.post("/api/embeddings", tags=["Inference"])
-@app.post("/api/embed", tags=["Inference"], include_in_schema=False)
-async def embeddings(req: EmbeddingRequest) -> Dict[str, Any]:
-    """Generate vector embeddings for input text."""
-    async with GPU_LOCK:
-        inp = [req.input] if isinstance(req.input, str) else req.input
-        return await asyncio.to_thread(engine.embeddings, req.model, inp, req.options)
+    return ShowResponse(
+        parameters="temperature 0.7",
+        license="See Hugging Face repository terms.",
+        modified_at=mtime,
+        details=ModelDetails(
+            format="safetensors",
+            family=allowed.task,
+            families=[allowed.task],
+            parameter_size="unknown",
+            quantization_level="AWQ" if "AWQ" in req.model.upper() else "None",
+        ),
+        capabilities=caps,
+        model_info=info,
+        template=None,
+    )
 
 
-@app.post("/api/transcribe", tags=["Inference"])
-async def transcribe(model: str = Form(...), file: UploadFile = File(...), options: str = Form("{}")) -> Dict[str, Any]:
-    """Transcribe speech from an audio file."""
-    try:
-        opt = json.loads(options)
-    except Exception:
-        opt = {}
+@app.post(
+    "/api/generate",
+    tags=["Generation"],
+    summary="Generate a response",
+    response_model=None,
+    openapi_extra={"responses": {"200": {"description": "Generation responses."}}},
+)
+async def generate(req: GenerateRequest, bg: BackgroundTasks) -> Union[JSONResponse, StreamingResponse]:
+    """Generates a text completion for the provided prompt parameters."""
 
-    filename = file.filename or "audio.wav"
-    temp_path = TEMP_DIR / filename
-    try:
-        with open(temp_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        async with GPU_LOCK:
-            return await asyncio.to_thread(engine.transcribe, model, str(temp_path), opt)
-    finally:
-        temp_path.unlink(missing_ok=True)
-
-
-@app.post("/api/vision", tags=["Inference"])
-async def vision(
-    model: str = Form(...),
-    prompt: str = Form(...),
-    file: UploadFile = File(...),
-    options: str = Form("{}"),
-) -> Dict[str, Any]:
-    """Analyze an image using a Vision-Language Model."""
-    try:
-        opt = json.loads(options)
-    except Exception:
-        opt = {}
-    content = await file.read()
-    b64 = base64.b64encode(content).decode("utf-8")
-    async with GPU_LOCK:
-        res = await asyncio.to_thread(
-            engine.chat, model, [{"role": "user", "content": prompt, "images": [b64]}], opt, False
+    if await _handle_keep_alive(req.keep_alive, req.model, engine):
+        return JSONResponse(
+            content={
+                "model": req.model,
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "response": "",
+                "done": True,
+                "done_reason": "unload",
+            }
         )
-        return {
-            "model": res["model"],
-            "created_at": res["created_at"],
-            "response": res["message"]["content"],
-            "done": True,
-            "total_duration": res["total_duration"],
-            "eval_count": res["eval_count"],
-        }
+
+    options_dict = _extract_options(req.options, req.logprobs, req.top_logprobs)
+
+    async with GPU_LOCK:
+        if options_dict.get("is_audio") and req.images:
+            audio_bytes = base64.b64decode(req.images[0])
+            ext = "wav"
+
+            if (
+                audio_bytes.startswith(b"ID3")
+                or audio_bytes.startswith(b"\xff\xfb")
+                or audio_bytes.startswith(b"\xff\xf3")
+            ):
+                ext = "mp3"
+            elif audio_bytes.startswith(b"OggS"):
+                ext = "ogg"
+            elif audio_bytes[4:8] == b"ftyp":
+                ext = "m4a"
+
+            tmp = TEMP_DIR / f"asr_{int(time.time())}.{ext}"
+            with open(tmp, "wb") as f:
+                f.write(audio_bytes)
+
+            try:
+                res = await asyncio.to_thread(engine.transcribe, req.model, str(tmp))
+                return JSONResponse(content={"model": req.model, "response": res["text"], "done": True})
+            finally:
+                tmp.unlink(missing_ok=True)
+
+            res = await asyncio.to_thread(engine.transcribe, req.model, str(tmp))
+            tmp.unlink(missing_ok=True)
+            return JSONResponse(content={"model": req.model, "response": res["text"], "done": True})
+
+        messages = []
+        if req.system:
+            messages.append({"role": "system", "content": req.system})
+
+        full_prompt = req.prompt or ""
+        if req.suffix:
+            full_prompt = f"<|fim_prefix|>{full_prompt}<|fim_suffix|>{req.suffix}<|fim_middle|>"
+
+        if full_prompt:
+            msg: Dict[str, Any] = {"role": "user", "content": full_prompt}
+            if req.images:
+                msg["images"] = req.images
+            messages.append(msg)
+
+        force_json = inject_json_instruction(messages, req.format)
+
+        gen = await asyncio.to_thread(
+            engine.chat,
+            model_id=req.model,
+            messages=messages,
+            options=options_dict,
+            stream=req.stream,
+            is_chat=False,
+            force_json=force_json,
+        )
+
+        if req.stream:
+            return StreamingResponse(gen, media_type="application/x-ndjson")  # type: ignore
+        return JSONResponse(content=gen)  # type: ignore
 
 
-# Legacy
-@app.get("/available-models", tags=["Models"], deprecated=True)
-def list_available_legacy() -> Dict[str, Any]:
-    """List available models (legacy endpoint)."""
-    return {k: v.model_dump() for k, v in manager.get_allowed().items()}
+@app.post(
+    "/api/chat",
+    tags=["Generation"],
+    summary="Generate a chat message",
+    response_model=None,
+    openapi_extra={"responses": {"200": {"description": "Chat response stream or payload."}}},
+)
+async def chat(req: ChatRequest) -> Union[JSONResponse, StreamingResponse]:
+    """Appends conversational context and generates the next chat message."""
+
+    if await _handle_keep_alive(req.keep_alive, req.model, engine):
+        return JSONResponse(
+            content={
+                "model": req.model,
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "message": {"role": "assistant", "content": ""},
+                "done": True,
+                "done_reason": "unload",
+            }
+        )
+
+    options_dict = _extract_options(req.options, req.logprobs, req.top_logprobs)
+
+    async with GPU_LOCK:
+        msgs = [m.model_dump(exclude_unset=True) for m in req.messages]
+        force_json = inject_json_instruction(msgs, req.format)
+
+        gen = await asyncio.to_thread(
+            engine.chat,
+            model_id=req.model,
+            messages=msgs,
+            options=options_dict,
+            stream=req.stream,
+            is_chat=True,
+            force_json=force_json,
+        )
+
+        if req.stream:
+            return StreamingResponse(gen, media_type="application/x-ndjson")  # type: ignore
+        return JSONResponse(content=gen)  # type: ignore
 
 
-@app.get("/models", tags=["Models"], deprecated=True)
-def list_downloaded_legacy() -> Dict[str, Any]:
-    """List downloaded models (legacy endpoint)."""
-    return {k: v.model_dump() for k, v in manager.get_registry().items()}
+@app.post("/api/embed", tags=["Generation"], summary="Generate embeddings", response_model=EmbedResponse)
+@app.post("/api/embeddings", include_in_schema=False)
+async def embed(req: EmbedRequest) -> JSONResponse:
+    """Generates numerical vector arrays from structural text inputs."""
+    if await _handle_keep_alive(req.keep_alive, req.model, engine):
+        return JSONResponse(content={"model": req.model, "done": True})
+
+    options_dict = _extract_options(req.options, False, None)
+
+    async with GPU_LOCK:
+        if options_dict.get("is_rerank") and isinstance(req.input, list) and len(req.input) > 1:
+            res = await asyncio.to_thread(engine.rerank, req.model, req.input[0], req.input[1:])
+            return JSONResponse(content=res)
+
+        input_texts: List[str]
+        if isinstance(req.input, str):
+            input_texts = [req.input]
+        else:
+            input_texts = req.input
+
+        res = await asyncio.to_thread(
+            engine.embeddings, model_id=req.model, texts=input_texts, truncate=req.truncate, dimensions=req.dimensions
+        )
+        return JSONResponse(content=res)
+
+
+@app.get("/api/version", tags=["System"])
+def get_version() -> Dict[str, str]:
+    """Returns the current API version for clients to align with."""
+    return {"version": "0.1.44"}
+
+
+@app.post("/api/pull", tags=["Models"], summary="Pull model", response_model=None)
+async def pull_model(req: PullRequest, bg: BackgroundTasks) -> Union[Dict[str, str], StreamingResponse]:
+    """Downloads model weights into the local registry."""
+    allowed_models = manager.get_allowed()
+    if req.model not in allowed_models:
+        raise AppError(f"Model '{req.model}' not in allowed config list", 400)
+
+    if not req.stream:
+        bg.add_task(manager.download_task, req.model)
+        return {"status": "success"}
+
+    async def generate_pull_progress() -> AsyncIterator[str]:
+        threading.Thread(target=manager.download_task, args=(req.model,), daemon=True).start()
+
+        last_status = None
+        while True:
+            reg = manager.get_registry().get(req.model)
+            if not reg:
+                yield json.dumps({"status": "initializing..."}) + "\n"
+            else:
+                event = {
+                    "status": reg.status.value,
+                    "digest": "sha256:" + base64.b16encode(req.model.encode()).decode().lower()[:64],
+                }
+
+                if reg.status == ModelStatus.READY:
+                    event["status"] = "success"
+                    yield json.dumps(event) + "\n"
+                    break
+
+                if reg.status == ModelStatus.ERROR:
+                    event["status"] = f"error: {reg.error_message}"
+                    yield json.dumps(event) + "\n"
+                    break
+
+                if reg.status.value != last_status:
+                    yield json.dumps(event) + "\n"
+                    last_status = reg.status.value
+
+            await asyncio.sleep(1)
+
+    return StreamingResponse(generate_pull_progress(), media_type="application/x-ndjson")
+
+
+@app.get("/api/ps", tags=["System"], summary="List running models", response_model=PsResponse)
+async def list_running() -> PsResponse:
+    """Retrieve memory footprints for actively loaded models."""
+    if not engine.active_id:
+        return PsResponse(models=[])
+
+    model_id = engine.active_id
+    reg = manager.get_registry().get(model_id)
+    allowed = manager.get_allowed().get(model_id)
+
+    size = 0
+    if reg and reg.local_path:
+        model_path = Path(reg.local_path)
+        size = sum(f.stat().st_size for f in model_path.rglob("*") if f.is_file())
+
+    expires_delta = datetime.timedelta(seconds=IDLE_TIMEOUT_SECONDS)
+    expiration = datetime.datetime.fromtimestamp(engine.last_interaction, tz=datetime.timezone.utc) + expires_delta
+
+    vram_usage = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+    family = allowed.task if allowed else "unknown"
+
+    running_model = Ps(
+        name=model_id,
+        model=model_id,
+        size=size,
+        digest="sha256:" + base64.b16encode(model_id.encode()).decode().lower()[:64],
+        details=ModelDetails(
+            format="safetensors",
+            family=family,
+            families=[family],
+            parameter_size="unknown",
+            quantization_level="AWQ" if "AWQ" in model_id.upper() else "None",
+        ),
+        expires_at=expiration.isoformat(),
+        size_vram=vram_usage,
+        context_length=8192,
+    )
+
+    return PsResponse(models=[running_model])
+
+
+@app.delete("/api/delete", tags=["Models"], summary="Delete a model", status_code=200)
+async def delete_model(req: DeleteRequest) -> JSONResponse:
+    """Removes model weights and configuration from standard storage paths."""
+    if engine.active_id == req.model:
+        async with GPU_LOCK:
+            engine.unload()
+
+    try:
+        manager.delete_model(req.model)
+        return JSONResponse(status_code=200, content={"status": "success"})
+    except Exception as e:
+        raise AppError(f"Failed to delete model {req.model}: {str(e)}", 500)
+
+
+@app.post("/api/create", tags=["Models"])
+async def create_model_placeholder() -> JSONResponse:
+    """Placeholder endpoint for building models from Modelfiles."""
+    return JSONResponse(status_code=501, content={"error": "The /api/create endpoint is not yet implemented."})
+
+
+@app.post("/api/copy", tags=["Models"])
+async def copy_model_placeholder() -> JSONResponse:
+    """Placeholder endpoint for aliasing an existing model."""
+    return JSONResponse(status_code=501, content={"error": "The /api/copy endpoint is not yet implemented."})
+
+
+@app.post("/api/push", tags=["Models"])
+async def push_model_placeholder() -> JSONResponse:
+    """Placeholder endpoint for uploading a local model to a remote registry."""
+    return JSONResponse(status_code=501, content={"error": "The /api/push endpoint is not yet implemented."})

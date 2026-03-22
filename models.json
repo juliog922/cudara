@@ -1,95 +1,37 @@
 {
     "_documentation": {
-        "how_to_add_models": "For GGUF, specify 'filename'. Wildcards (*) allowed.",
-        "tasks": ["text-generation", "image-to-text", "feature-extraction", "automatic-speech-recognition"]
+        "how_to_add_models": "All models use the transformers backend. Specify official AWQ/GPTQ Hugging Face repos for pre-quantized LLMs/VLMs.",
+        "tasks": ["text-generation", "image-to-text", "feature-extraction", "automatic-speech-recognition", "text-classification"]
     },
-    
-    "Qwen/Qwen2.5-3B-Instruct-GGUF": {
-        "description": "Generation model. GGUF Q4_K_M.",
-        "task": "text-generation",
-        "filename": "*q4_k_m.gguf",
-        "system_prompt": "You are Qwen, a helpful assistant.",
-        "generation_defaults": {
-            "n_ctx": 0,          
-            "n_gpu_layers": -1
-        }
-    },
-    "unsloth/Qwen2.5-VL-3B-Instruct-GGUF": {
-        "description": "Vision Language Model.",
+    "Qwen/Qwen2.5-VL-3B-Instruct-AWQ": {
+        "description": "Vision Language Model. Pre-quantized AWQ.",
         "task": "image-to-text",
-        "filename": "*Q4_K_M.gguf",
-        "projector_filename": "*mmproj*.gguf",
-        "chat_handler": "llama_cpp.llama_chat_format.Qwen2VLChatHandler",
-        "generation_defaults": {
-            "n_ctx": 0,          
-            "n_gpu_layers": -1
-        }
+        "backend": "transformers"
+    },
+    "Qwen/Qwen2.5-72B-Instruct-AWQ": {
+        "description": "Large text generation model. Pre-quantized AWQ.",
+        "task": "text-generation",
+        "backend": "transformers",
+        "system_prompt": "You are Qwen, a helpful assistant."
+    },
+    "Qwen/Qwen2.5-3B-Instruct-AWQ": {
+        "description": "Small text generation model. Pre-quantized AWQ.",
+        "task": "text-generation",
+        "backend": "transformers"
     },
     "sentence-transformers/all-MiniLM-L6-v2": {
-        "description": "Embeddings (Transformers backend).",
+        "description": "Embeddings.",
         "task": "feature-extraction",
         "backend": "transformers"
     },
-    "openai/whisper-small": {
-        "description": "Whisper ASR (Transformers backend).",
+    "openai/whisper-base": {
+        "description": "Whisper ASR.",
         "task": "automatic-speech-recognition",
         "backend": "transformers"
     },
     "BAAI/bge-reranker-v2-m3": {
-        "description": "Reranker (Transformers backend).",
+        "description": "Reranker.",
         "task": "text-classification",
         "backend": "transformers"
-    },
-    "Qwen/Qwen3-4B-GGUF": {
-        "description": "Generation model. GGUF Q4_K_M.",
-        "task": "text-generation",
-        "filename": "*Q4_K_M.gguf",
-        "system_prompt": "You are a helpful assistant.",
-        "generation_defaults": {
-            "n_ctx": 0,          
-            "n_gpu_layers": -1
-        }
-    },
-    "unsloth/Qwen3-4B-Instruct-2507-GGUF": {
-        "description": "Generation model. GGUF Q4_K_M.",
-        "task": "text-generation",
-        "filename": "*Q4_K_M.gguf",
-        "system_prompt": "You are a helpful assistant.",
-        "generation_defaults": { 
-            "n_ctx": 4096,       
-            "n_gpu_layers": -1
-        }
-    },
-
-    "Qwen/Qwen2.5-72B-Instruct-GGUF": {
-        "description": "Generation model. GGUF Q4_K_M.",
-        "task": "text-generation",
-        "filename": "*q4_k_m-*.gguf",
-        "system_prompt": "You are Qwen, a helpful assistant.",
-        "generation_defaults": {
-            "n_ctx": 0,          
-            "n_gpu_layers": -1
-        }
-    },
-    "unsloth/Qwen2.5-VL-72B-Instruct-GGUF": {
-        "description": "Vision Language Model.",
-        "task": "image-to-text",
-        "filename": "*Q4_K_M*.gguf",
-        "projector_filename": "*mmproj*.gguf",
-        "chat_handler": "llama_cpp.llama_chat_format.Qwen2VLChatHandler",
-        "generation_defaults": {
-            "n_ctx": 0,          
-            "n_gpu_layers": -1
-        }
-    },
-    "Qwen/Qwen3-32B-GGUF": {
-        "description": "Generation model. GGUF Q4_K_M.",
-        "task": "text-generation",
-        "filename": "*Q4_K_M*.gguf",
-        "system_prompt": "You are Qwen, a helpful assistant.",
-        "generation_defaults": {
-            "n_ctx": 0,          
-            "n_gpu_layers": -1
-        }
     }
 }

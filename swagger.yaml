@@ -1,168 +1,20 @@
 openapi: 3.1.0
 info:
-  title: Cudara API
-  description: |
-    Lightweight CUDA inference server with Ollama-compatible API.
-    
-    Supports:
-    - Text Generation (LLMs)
-    - Vision-Language Models (VLMs)
-    - Embeddings
-    - Speech Recognition (ASR)
-  version: 1.0.0
-  license:
-    name: MIT
-
+  title: Cudara Inference API
+  description: Lightweight CUDA inference server providing an Ollama-compatible interface for LLMs, VLMs, and Embeddings.
+  version: 0.0.1
+  contact:
+    name: Julio Galindo
 servers:
   - url: http://localhost:8000
     description: Local development server
 
-tags:
-  - name: Health
-    description: Server health and status
-  - name: Models
-    description: Model management (Ollama-compatible)
-  - name: Inference
-    description: Model inference endpoints
-
 paths:
-  /:
-    get:
-      tags: [Health]
-      summary: Root health check
-      operationId: healthRoot
-      responses:
-        '200':
-          description: Server is healthy
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HealthResponse'
-
-  /health:
-    get:
-      tags: [Health]
-      summary: Health check
-      operationId: health
-      responses:
-        '200':
-          description: Server status
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HealthResponse'
-
-  /api/tags:
-    get:
-      tags: [Models]
-      summary: List available models
-      description: Returns all configured models and their status (Ollama-compatible)
-      operationId: listModels
-      responses:
-        '200':
-          description: List of models
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ModelListResponse'
-
-  /api/show:
-    post:
-      tags: [Models]
-      summary: Show model details
-      description: Get detailed information about a specific model
-      operationId: showModel
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [name]
-              properties:
-                name:
-                  type: string
-                  description: Model identifier
-                  example: "Qwen/Qwen2.5-3B-Instruct"
-      responses:
-        '200':
-          description: Model details
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ModelShowResponse'
-        '404':
-          description: Model not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /api/pull:
-    post:
-      tags: [Models]
-      summary: Pull/download a model
-      description: Download a model from HuggingFace (Ollama-compatible)
-      operationId: pullModel
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/PullRequest'
-      responses:
-        '200':
-          description: Download started
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  status:
-                    type: string
-                    example: "downloading"
-        '403':
-          description: Model not in allowed list
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /api/delete:
-    delete:
-      tags: [Models]
-      summary: Delete a model
-      description: Remove a downloaded model
-      operationId: deleteModel
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [name]
-              properties:
-                name:
-                  type: string
-                  example: "Qwen/Qwen2.5-3B-Instruct"
-      responses:
-        '200':
-          description: Model deleted
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  status:
-                    type: string
-                    example: "deleted"
-
+  # --- INFERENCE ENDPOINTS ---
   /api/generate:
     post:
       tags: [Inference]
-      summary: Generate text completion
-      description: Generate text from a prompt (Ollama-compatible)
-      operationId: generate
+      summary: Generate a response (Ollama compatible)
       requestBody:
         required: true
         content:
@@ -171,433 +23,217 @@ paths:
               $ref: '#/components/schemas/GenerateRequest'
       responses:
         '200':
-          description: Generated response
+          description: Successful completion (JSON or NDJSON stream)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/GenerateResponse'
-        '404':
-          description: Model not found or not ready
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /api/chat:
-    post:
-      tags: [Inference]
-      summary: Chat completion
-      description: Generate chat response from messages (Ollama-compatible)
-      operationId: chat
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ChatRequest'
-      responses:
-        '200':
-          description: Chat response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ChatResponse'
-        '404':
-          description: Model not found or not ready
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /api/embeddings:
-    post:
-      tags: [Inference]
-      summary: Generate embeddings
-      description: Generate vector embeddings for text (Ollama-compatible)
-      operationId: embeddings
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/EmbeddingRequest'
-      responses:
-        '200':
-          description: Embeddings response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/EmbeddingResponse'
         '400':
-          description: Model is not an embedding model
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
+          $ref: '#/components/responses/AppError'
 
   /api/embed:
     post:
       tags: [Inference]
-      summary: Generate embeddings (alias)
-      description: Alias for /api/embeddings
-      operationId: embed
+      summary: Generate embeddings
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/EmbeddingRequest'
+              $ref: '#/components/schemas/EmbedRequest'
       responses:
         '200':
-          description: Embeddings response
+          description: Successful embedding generation
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/EmbeddingResponse'
+                $ref: '#/components/schemas/EmbedResponse'
 
-  /api/transcribe:
+  # --- MANAGEMENT ENDPOINTS ---
+  /api/tags:
+    get:
+      tags: [Models]
+      summary: List local models
+      description: Returns all models available in the local registry/storage.
+      responses:
+        '200':
+          description: List of models
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PsResponse'
+
+  /api/ps:
+    get:
+      tags: [Models]
+      summary: List running models
+      description: Returns the model currently loaded into VRAM.
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PsResponse'
+
+  /api/show:
     post:
-      tags: [Inference]
-      summary: Transcribe audio
-      description: Transcribe audio file using ASR model (Whisper)
-      operationId: transcribe
+      tags: [Models]
+      summary: Show model information
       requestBody:
         required: true
         content:
-          multipart/form-data:
+          application/json:
             schema:
-              type: object
-              required: [model, file]
-              properties:
-                model:
-                  type: string
-                  description: ASR model to use
-                  example: "openai/whisper-small"
-                file:
-                  type: string
-                  format: binary
-                  description: Audio file to transcribe
-                options:
-                  type: string
-                  description: JSON options
-                  default: "{}"
+              $ref: '#/components/schemas/ShowRequest'
       responses:
         '200':
-          description: Transcription result
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TranscribeResponse'
-        '400':
-          description: Model is not an ASR model
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: '#/components/schemas/ShowResponse'
 
-  /api/vision:
-    post:
-      tags: [Inference]
-      summary: Process image with VLM
-      description: Analyze image using Vision-Language Model
-      operationId: vision
+  /api/delete:
+    delete:
+      tags: [Models]
+      summary: Delete a model
       requestBody:
         required: true
         content:
-          multipart/form-data:
+          application/json:
             schema:
-              type: object
-              required: [model, prompt, file]
-              properties:
-                model:
-                  type: string
-                  description: VLM model to use
-                  example: "unsloth/Qwen2.5-VL-3B-Instruct-unsloth-bnb-4bit"
-                prompt:
-                  type: string
-                  description: Prompt/question about the image
-                  example: "What is in this image?"
-                file:
-                  type: string
-                  format: binary
-                  description: Image file to analyze
-                options:
-                  type: string
-                  description: JSON options
-                  default: "{}"
+              $ref: '#/components/schemas/DeleteRequest'
       responses:
         '200':
-          description: Vision response
+          description: Model deleted successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/GenerateResponse'
+                type: object
+                properties:
+                  status: { type: string, example: "success" }
 
-  /available-models:
+  /api/version:
     get:
-      tags: [Models]
-      summary: List configured models (legacy)
-      operationId: listAvailable
-      deprecated: true
+      tags: [System]
+      summary: Get server version
       responses:
         '200':
-          description: Configured models
-
-  /models:
-    get:
-      tags: [Models]
-      summary: List downloaded models (legacy)
-      operationId: listDownloaded
-      deprecated: true
-      responses:
-        '200':
-          description: Downloaded models
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version: { type: string, example: "0.0.1" }
 
 components:
+  responses:
+    AppError:
+      description: Custom Application Error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
   schemas:
-    HealthResponse:
+    # --- REQUESTS ---
+    GenerateRequest:
+      type: object
+      required: [model, prompt]
+      properties:
+        model: { type: string }
+        prompt: { type: string }
+        system: { type: string }
+        stream: { type: boolean, default: false }
+        images:
+          type: array
+          items: { type: string, description: "Base64 encoded images" }
+        options:
+          type: object
+          properties:
+            temperature: { type: number, default: 0.7 }
+            top_p: { type: number, default: 0.9 }
+            max_new_tokens: { type: integer, default: 512 }
+
+    EmbedRequest:
+      type: object
+      required: [model, input]
+      properties:
+        model: { type: string }
+        input:
+          oneOf:
+            - type: string
+            - type: array
+              items: { type: string }
+
+    ShowRequest:
+      type: object
+      required: [model]
+      properties:
+        model: { type: string }
+
+    DeleteRequest:
+      type: object
+      required: [model]
+      properties:
+        model: { type: string }
+
+    # --- RESPONSES ---
+    GenerateResponse:
       type: object
       properties:
-        status:
-          type: string
-          example: "ok"
-        version:
-          type: string
-          example: "1.0.0"
-        active_model:
-          type: string
-          nullable: true
-          example: "Qwen/Qwen2.5-3B-Instruct"
-        cuda_available:
-          type: boolean
-          example: true
-        vram_used:
-          type: string
-          example: "2.5GB"
+        model: { type: string }
+        created_at: { type: string, format: date-time }
+        response: { type: string }
+        done: { type: boolean }
+        context: { type: array, items: { type: integer } }
+        total_duration: { type: integer }
 
-    ModelListResponse:
+    EmbedResponse:
+      type: object
+      properties:
+        model: { type: string }
+        embeddings:
+          type: array
+          items: { type: array, items: { type: number } }
+
+    PsResponse:
       type: object
       properties:
         models:
           type: array
           items:
-            type: object
-            properties:
-              name:
-                type: string
-                example: "Qwen/Qwen2.5-3B-Instruct"
-              modified_at:
-                type: string
-                format: date-time
-              size:
-                type: integer
-              digest:
-                type: string
-              details:
-                type: object
-                properties:
-                  format:
-                    type: string
-                  family:
-                    type: string
-                  parameter_size:
-                    type: string
-                  quantization_level:
-                    type: string
-              status:
-                type: string
-                enum: [ready, downloading, quantizing, error, not_downloaded]
-              description:
-                type: string
+            $ref: '#/components/schemas/ModelDetails'
 
-    ModelShowResponse:
+    ShowResponse:
       type: object
       properties:
-        modelfile:
-          type: string
-        parameters:
-          type: string
-        template:
-          type: string
+        modelfile: { type: string }
+        parameters: { type: string }
+        template: { type: string }
         details:
-          type: object
-        model_info:
-          type: object
+          $ref: '#/components/schemas/ModelMeta'
 
-    PullRequest:
-      type: object
-      required: [name]
-      properties:
-        name:
-          type: string
-          description: Model identifier (HuggingFace repo ID)
-          example: "Qwen/Qwen2.5-3B-Instruct"
-        stream:
-          type: boolean
-          default: false
-
-    GenerateRequest:
-      type: object
-      required: [model, prompt]
-      properties:
-        model:
-          type: string
-          description: Model to use
-          example: "Qwen/Qwen2.5-3B-Instruct"
-        prompt:
-          type: string
-          description: Input prompt
-          example: "Hello, how are you?"
-        system:
-          type: string
-          description: System prompt override
-        images:
-          type: array
-          items:
-            type: string
-          description: Base64-encoded images (for VLMs)
-        stream:
-          type: boolean
-          default: false
-        options:
-          type: object
-          description: Generation options
-          properties:
-            temperature:
-              type: number
-            top_p:
-              type: number
-            top_k:
-              type: integer
-            num_predict:
-              type: integer
-              description: Max tokens to generate
-
-    GenerateResponse:
+    ModelDetails:
       type: object
       properties:
-        model:
-          type: string
-        created_at:
-          type: string
-          format: date-time
-        response:
-          type: string
-        done:
-          type: boolean
-        total_duration:
-          type: integer
-          description: Total time in nanoseconds
-        eval_count:
-          type: integer
-          description: Tokens generated
-        eval_duration:
-          type: integer
-          description: Generation time in nanoseconds
+        name: { type: string }
+        model: { type: string }
+        modified_at: { type: string, format: date-time }
+        size: { type: integer }
+        size_vram: { type: integer }
+        details:
+          $ref: '#/components/schemas/ModelMeta'
 
-    ChatRequest:
-      type: object
-      required: [model, messages]
-      properties:
-        model:
-          type: string
-          example: "Qwen/Qwen2.5-3B-Instruct"
-        messages:
-          type: array
-          items:
-            type: object
-            required: [role, content]
-            properties:
-              role:
-                type: string
-                enum: [system, user, assistant]
-              content:
-                type: string
-              images:
-                type: array
-                items:
-                  type: string
-        stream:
-          type: boolean
-          default: false
-        options:
-          type: object
-
-    ChatResponse:
+    ModelMeta:
       type: object
       properties:
-        model:
-          type: string
-        created_at:
-          type: string
-          format: date-time
-        message:
-          type: object
-          properties:
-            role:
-              type: string
-            content:
-              type: string
-        done:
-          type: boolean
-        total_duration:
-          type: integer
-        eval_count:
-          type: integer
-        eval_duration:
-          type: integer
-
-    EmbeddingRequest:
-      type: object
-      required: [model, input]
-      properties:
-        model:
-          type: string
-          example: "sentence-transformers/all-MiniLM-L6-v2"
-        input:
-          oneOf:
-            - type: string
-            - type: array
-              items:
-                type: string
-          description: Text(s) to embed
-        options:
-          type: object
-
-    EmbeddingResponse:
-      type: object
-      properties:
-        model:
-          type: string
-        embeddings:
-          type: array
-          items:
-            type: array
-            items:
-              type: number
-        total_duration:
-          type: integer
-
-    TranscribeResponse:
-      type: object
-      properties:
-        model:
-          type: string
-        text:
-          type: string
-          description: Transcribed text
-        total_duration:
-          type: integer
+        format: { type: string }
+        family: { type: string }
+        parameter_size: { type: string }
+        quantization_level: { type: string }
 
     ErrorResponse:
       type: object
       properties:
-        error:
-          type: object
-          properties:
-            code:
-              type: string
-              example: "model_not_found"
-            message:
-              type: string
-              example: "Model 'xyz' not found"
+        error: { type: string }
+        status_code: { type: integer }

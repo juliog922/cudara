@@ -6,15 +6,17 @@ Provides commands for serving the API, managing models, and running queries.
 """
 
 import argparse
+import base64
 import json
+import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
 # Default configuration constants
-DEFAULT_HOST: str = "http://localhost:8000"
+DEFAULT_HOST: str = os.getenv("CUDARA_HOST", "http://localhost:8000")
 CONFIG_FILE: Path = Path.home() / ".cudara" / "config.json"
 
 
@@ -33,35 +35,63 @@ def save_config(config: Dict[str, str]) -> None:
         json.dump(config, f, indent=2)
 
 
-def get_client(host: Optional[str] = None, timeout: float = 300.0) -> httpx.Client:
-    """
-    Create an HTTP client configured for the Cudara API.
-
-    Args:
-        host: Optional host override (e.g., http://localhost:8000).
-        timeout: Request timeout in seconds.
-
-    Returns:
-        httpx.Client: Configured client instance.
-    """
+def get_client(host: Optional[str] = None, timeout: float = 600.0) -> httpx.Client:
+    """Create an HTTP client configured for the Cudara API."""
     config = get_config()
     base_url = host or config.get("host", DEFAULT_HOST)
     return httpx.Client(base_url=base_url, timeout=timeout)
 
 
 def print_error(msg: str) -> None:
-    """Print an error message in red to stderr."""
+    """Print an error message to stderr in red."""
     print(f"\033[31mError: {msg}\033[0m", file=sys.stderr)
 
 
 def print_success(msg: str) -> None:
-    """Print a success message in green."""
+    """Print a success message to stdout in green."""
     print(f"\033[32m{msg}\033[0m")
 
 
 def print_info(msg: str) -> None:
-    """Print an informational message in cyan."""
+    """Print an info message to stdout in cyan."""
     print(f"\033[36m{msg}\033[0m")
+
+
+def format_size(size_bytes: int) -> str:
+    """Format bytes into human-readable strings like Ollama."""
+    if size_bytes == 0:
+        return "0 B"
+
+    size = float(size_bytes)  # Add this line
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024.0:
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} PB"
+
+
+def extract_images_from_prompt(prompt: str) -> Tuple[str, List[str]]:
+    """
+    Parses the prompt for local image file paths, removes them from the text,
+    and returns their base64 encoded strings for multimodal support.
+    """
+    images = []
+    clean_prompt_parts = []
+    for word in prompt.split():
+        # Basic check to see if word is a file path to an image
+        if Path(word).is_file() and word.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+            try:
+                with open(word, "rb") as f:
+                    images.append(base64.b64encode(f.read()).decode("utf-8"))
+            except Exception as e:
+                print_error(f"Failed to read image {word}: {e}")
+        else:
+            clean_prompt_parts.append(word)
+
+    return " ".join(clean_prompt_parts), images
+
+
+# --- CLI Commands ---
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
@@ -79,59 +109,75 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
 
 def cmd_list(args: argparse.Namespace) -> None:
-    """List available models via the API."""
+    """List available models via the API (matches 'ollama ls')."""
     try:
         with get_client(args.host) as client:
             response = client.get("/api/tags")
             response.raise_for_status()
-            data = response.json()
+            models = response.json().get("models", [])
 
-            models = data.get("models", [])
             if not models:
-                print("No models available. Add models to models.json and use 'cudara pull <model>'")
+                print("No models available.")
                 return
 
-            print(f"{'NAME':<50} {'STATUS':<15} {'DESCRIPTION'}")
-            print("-" * 100)
-
+            print(f"{'NAME':<30} {'ID':<15} {'SIZE':<10} {'MODIFIED'}")
             for model in models:
                 name = model.get("name", "unknown")
-                status = model.get("status", "unknown")
-                desc = model.get("description", "")[:40]
+                digest = model.get("digest", "")[7:19]  # strip sha256: and take first 12 chars
+                size = format_size(model.get("size", 0))
+                # Simple datetime formatting
+                mod_raw = model.get("modified_at", "").split("T")[0]
+                print(f"{name:<30} {digest:<15} {size:<10} {mod_raw}")
 
-                status_color = {
-                    "ready": "\033[32m",
-                    "downloading": "\033[33m",
-                    "error": "\033[31m",
-                }.get(status, "\033[90m")
-
-                print(f"{name:<50} {status_color}{status:<15}\033[0m {desc}")
-
-    except httpx.ConnectError:
-        print_error("Cannot connect to server. Is Cudara running?")
+    except Exception as e:
+        print_error(f"Cannot connect to server: {str(e)}")
         sys.exit(1)
+
+
+def cmd_ps(args: argparse.Namespace) -> None:
+    """List running models (matches 'ollama ps')."""
+    try:
+        with get_client(args.host) as client:
+            response = client.get("/api/ps")
+            response.raise_for_status()
+            models = response.json().get("models", [])
+
+            if not models:
+                print("No models currently running.")
+                return
+
+            print(f"{'NAME':<30} {'ID':<15} {'SIZE (VRAM)':<15} {'EXPIRES AT'}")
+            for model in models:
+                name = model.get("name", "unknown")
+                digest = model.get("digest", "")[7:19]
+                size = format_size(model.get("size_vram", 0))
+                expires = model.get("expires_at", "").replace("T", " ")[:19]
+                print(f"{name:<30} {digest:<15} {size:<15} {expires}")
+
     except Exception as e:
         print_error(str(e))
         sys.exit(1)
 
 
 def cmd_pull(args: argparse.Namespace) -> None:
-    """Trigger a model pull."""
+    """Trigger a model pull and stream progress."""
     try:
         with get_client(args.host) as client:
-            print_info(f"Pulling {args.model}...")
-            response = client.post("/api/pull", json={"name": args.model})
+            with client.stream("POST", "/api/pull", json={"model": args.model, "stream": True}) as response:
+                if response.status_code == 400:
+                    print_error(f"Model '{args.model}' is not in the allowed list (models.json).")
+                    sys.exit(1)
 
-            if response.status_code == 403:
-                print_error(f"Model '{args.model}' is not in the allowed list.")
-                print_info("Add it to models.json first.")
-                sys.exit(1)
-
-            response.raise_for_status()
-            print_success(f"Started downloading {args.model}")
-            print_info("Use 'cudara list' to check progress")
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if line:
+                        data = json.loads(line)
+                        status = data.get("status", "")
+                        print(f"\rpulling... {status:<30}", end="", flush=True)
+                print("\n\033[32msuccess\033[0m")
 
     except Exception as e:
+        print("\n")
         print_error(str(e))
         sys.exit(1)
 
@@ -140,100 +186,107 @@ def cmd_rm(args: argparse.Namespace) -> None:
     """Remove a model."""
     try:
         with get_client(args.host) as client:
-            response = client.request("DELETE", "/api/delete", json={"name": args.model})
+            response = client.request("DELETE", "/api/delete", json={"model": args.model})
             response.raise_for_status()
-            print_success(f"Deleted {args.model}")
+            print_success(f"deleted '{args.model}'")
+    except Exception as e:
+        print_error(str(e))
+        sys.exit(1)
+
+
+def cmd_stop(args: argparse.Namespace) -> None:
+    """Stop a running model by forcing its keep_alive to 0."""
+    try:
+        with get_client(args.host) as client:
+            response = client.post("/api/generate", json={"model": args.model, "keep_alive": 0})
+            response.raise_for_status()
+            print_success(f"stopped '{args.model}'")
     except Exception as e:
         print_error(str(e))
         sys.exit(1)
 
 
 def cmd_run(args: argparse.Namespace) -> None:
-    """Run a single completion prompt with streaming."""
+    """
+    Run a model. Acts as a single-prompt completion if a prompt is provided,
+    otherwise drops into an interactive chat session (matches 'ollama run').
+    """
     try:
-        with get_client(args.host, timeout=600.0) as client:
-            if args.prompt:
-                prompt = " ".join(args.prompt)
-            elif not sys.stdin.isatty():
-                prompt = sys.stdin.read().strip()
-            else:
-                print("Enter prompt (Ctrl+D to submit):")
-                prompt = sys.stdin.read().strip()
-
-            if not prompt:
-                print_error("No prompt provided")
-                sys.exit(1)
-
-            payload: Dict[str, Any] = {
-                "model": args.model,
-                "prompt": prompt,
-                "stream": True,  # Enabled NDJSON Streaming
-            }
-            if args.system:
-                payload["system"] = args.system
-
-            with client.stream("POST", "/api/generate", json=payload) as response:
-                if response.status_code == 404:
-                    print_error(f"Model '{args.model}' not found or not ready")
-                    sys.exit(1)
-
-                response.raise_for_status()
-
-                tokens = 0
-                duration_ms = 0
-                for line in response.iter_lines():
-                    if line:
-                        data = json.loads(line)
-                        print(data.get("response", ""), end="", flush=True)
-                        if data.get("done"):
-                            tokens = data.get("eval_count", 0)
-                            duration_ms = data.get("total_duration", 0) / 1_000_000
-                print()
-
-                if args.verbose:
-                    print_info(f"\n[{tokens} tokens, {duration_ms:.0f}ms]")
-
-    except Exception as e:
-        print_error(str(e))
-        sys.exit(1)
-
-
-def cmd_chat(args: argparse.Namespace) -> None:
-    """Start an interactive chat session with streaming."""
-    try:
-        with get_client(args.host, timeout=600.0) as client:
-            response = client.post("/api/show", json={"name": args.model})
+        with get_client(args.host) as client:
+            # First, verify the model exists/is ready
+            response = client.post("/api/show", json={"model": args.model})
             if response.status_code == 404:
-                print_error(f"Model '{args.model}' not found")
+                print_error(f"Error: model '{args.model}' not found, try pulling it first")
                 sys.exit(1)
 
-            print_info(f"Chatting with {args.model}")
-            print_info("Type 'exit' or Ctrl+C to quit, '/clear' to reset\n")
+            # 1. Single Prompt Execution
+            if args.prompt or not sys.stdin.isatty():
+                if args.prompt:
+                    prompt = " ".join(args.prompt)
+                else:
+                    prompt = sys.stdin.read().strip()
 
-            messages: list[Dict[str, str]] = []
-            if args.system:
-                messages.append({"role": "system", "content": args.system})
+                if not prompt:
+                    return
+
+                prompt, images = extract_images_from_prompt(prompt)
+
+                payload: Dict[str, Any] = {
+                    "model": args.model,
+                    "prompt": prompt,
+                    "stream": True,
+                }
+                if images:
+                    payload["images"] = images
+
+                with client.stream("POST", "/api/generate", json=payload) as response:
+                    response.raise_for_status()
+                    for line in response.iter_lines():
+                        if line:
+                            data = json.loads(line)
+                            print(data.get("response", ""), end="", flush=True)
+                print()
+                return
+
+            # 2. Interactive Chat Execution
+            messages: List[Dict[str, Any]] = []
+            print_info("Type '/bye' to exit, '/clear' to reset, '\"\"\"' for multiline input.")
 
             while True:
                 try:
-                    user_input = input("\033[32m>>> \033[0m").strip()
-                except EOFError:
+                    user_input = input(">>> ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
                     break
+
                 if not user_input:
                     continue
-                if user_input.lower() == "exit":
+                if user_input.lower() in ["/bye", "exit", "quit"]:
                     break
                 if user_input == "/clear":
                     messages = []
-                    if args.system:
-                        messages.append({"role": "system", "content": args.system})
-                    print_info("Chat cleared")
+                    print_info("Cleared session context")
                     continue
 
-                messages.append({"role": "user", "content": user_input})
-                assistant_msg = ""
+                # Multiline support
+                if user_input.startswith('"""'):
+                    lines = [user_input[3:]]
+                    while True:
+                        line = input("... ")
+                        if line.endswith('"""'):
+                            lines.append(line[:-3])
+                            break
+                        lines.append(line)
+                    user_input = "\n".join(lines).strip()
 
-                print()
+                user_input, images = extract_images_from_prompt(user_input)
+
+                msg: Dict[str, Any] = {"role": "user", "content": user_input}
+                if images:
+                    msg["images"] = images
+                messages.append(msg)
+
+                assistant_msg = ""
                 with client.stream(
                     "POST", "/api/chat", json={"model": args.model, "messages": messages, "stream": True}
                 ) as stream_response:
@@ -242,59 +295,58 @@ def cmd_chat(args: argparse.Namespace) -> None:
                         if line:
                             data = json.loads(line)
                             chunk = data.get("message", {}).get("content", "")
+
+                            # Optional: Handle separate thinking output if returned
+                            thinking = data.get("thinking")
+                            if thinking:
+                                # Grey text for thinking
+                                print(f"\033[90m{thinking}\033[0m", end="", flush=True)
+
                             print(chunk, end="", flush=True)
                             assistant_msg += chunk
 
                 print("\n")
                 messages.append({"role": "assistant", "content": assistant_msg})
 
-    except KeyboardInterrupt:
-        print("\nGoodbye!")
     except Exception as e:
         print_error(str(e))
         sys.exit(1)
 
 
-def cmd_ps(args: argparse.Namespace) -> None:
-    """Show server status and active model."""
+# --- Stubs for strict Ollama CLI compatibility ---
+
+
+def cmd_create(args: argparse.Namespace) -> None:
+    """Create a customized model (Stub)."""
     try:
         with get_client(args.host) as client:
-            response = client.get("/health")
-            response.raise_for_status()
-            data = response.json()
-            print(f"Status:       {data.get('status', 'unknown')}")
-            print(f"Active Model: {data.get('active_model') or 'none'}")
-            print(f"CUDA:         {data.get('cuda_available', False)}")
-            print(f"VRAM Used:    {data.get('vram_used', 'N/A')}")
+            response = client.post("/api/create", json={"name": "stub", "modelfile": "stub"})
+            if response.status_code == 501:
+                print_error("The 'create' command is not yet implemented in Cudara.")
+            else:
+                print(response.json())
     except Exception as e:
         print_error(str(e))
         sys.exit(1)
 
 
-def cmd_show(args: argparse.Namespace) -> None:
-    """Show model details."""
-    try:
-        with get_client(args.host) as client:
-            response = client.post("/api/show", json={"name": args.model})
-            if response.status_code == 404:
-                print_error(f"Model '{args.model}' not found")
-                sys.exit(1)
-            response.raise_for_status()
-            print(json.dumps(response.json(), indent=2))
-    except Exception as e:
-        print_error(str(e))
-        sys.exit(1)
-
-
-def cmd_config(args: argparse.Namespace) -> None:
-    """Read or write CLI configuration."""
-    config = get_config()
-    if args.host:
-        config["host"] = args.host
-        save_config(config)
-        print_success(f"Set host to {args.host}")
+def cmd_launch(args: argparse.Namespace) -> None:
+    """Launch integrations (Stub)."""
+    if getattr(args, "integration", None):
+        print_info(f"Launching integration: {args.integration}")
     else:
-        print(json.dumps(config, indent=2))
+        print_info("Interactive integration launcher not yet implemented.")
+        print("Supported targets: OpenCode, Claude Code, Codex, Droid")
+
+
+def cmd_signin(args: argparse.Namespace) -> None:
+    """Sign in (Stub)."""
+    print_info("Authentication is managed via Hugging Face token (HF_TOKEN env var).")
+
+
+def cmd_signout(args: argparse.Namespace) -> None:
+    """Sign out (Stub)."""
+    print_info("Authentication is managed via Hugging Face token (HF_TOKEN env var).")
 
 
 def main() -> None:
@@ -303,6 +355,7 @@ def main() -> None:
     parser.add_argument("--version", action="version", version="cudara 1.0.0")
     subparsers = parser.add_subparsers(dest="command", title="commands")
 
+    # Serve Command
     serve_parser = subparsers.add_parser("serve", help="Start the Cudara server")
     serve_parser.add_argument("--host", default="0.0.0.0")
     serve_parser.add_argument("--port", type=int, default=8000)
@@ -310,51 +363,61 @@ def main() -> None:
     serve_parser.add_argument("--workers", type=int, default=1)
     serve_parser.set_defaults(func=cmd_serve)
 
-    list_parser = subparsers.add_parser("list", aliases=["ls"])
+    # Run Command (Unified single-prompt and interactive chat)
+    run_parser = subparsers.add_parser("run", help="Run a model")
+    run_parser.add_argument("model", help="Model name to run")
+    run_parser.add_argument("prompt", nargs="*", help="Optional prompt to execute a single completion")
+    run_parser.add_argument("--host")
+    run_parser.set_defaults(func=cmd_run)
+
+    # List/Ps Commands
+    list_parser = subparsers.add_parser("list", aliases=["ls"], help="List models")
     list_parser.add_argument("--host")
     list_parser.set_defaults(func=cmd_list)
 
-    pull_parser = subparsers.add_parser("pull")
-    pull_parser.add_argument("model")
-    pull_parser.add_argument("--host")
-    pull_parser.set_defaults(func=cmd_pull)
-
-    rm_parser = subparsers.add_parser("rm", aliases=["delete"])
-    rm_parser.add_argument("model")
-    rm_parser.add_argument("--host")
-    rm_parser.set_defaults(func=cmd_rm)
-
-    run_parser = subparsers.add_parser("run")
-    run_parser.add_argument("model")
-    run_parser.add_argument("prompt", nargs="*")
-    run_parser.add_argument("--system", "-s")
-    run_parser.add_argument("--host")
-    run_parser.add_argument("--verbose", "-v", action="store_true")
-    run_parser.set_defaults(func=cmd_run)
-
-    chat_parser = subparsers.add_parser("chat")
-    chat_parser.add_argument("model")
-    chat_parser.add_argument("--system", "-s")
-    chat_parser.add_argument("--host")
-    chat_parser.set_defaults(func=cmd_chat)
-
-    ps_parser = subparsers.add_parser("ps")
+    ps_parser = subparsers.add_parser("ps", help="Show running models")
     ps_parser.add_argument("--host")
     ps_parser.set_defaults(func=cmd_ps)
 
-    show_parser = subparsers.add_parser("show")
-    show_parser.add_argument("model")
-    show_parser.add_argument("--host")
-    show_parser.set_defaults(func=cmd_show)
+    # Pull/Rm/Stop Commands
+    pull_parser = subparsers.add_parser("pull", help="Pull a model from a registry")
+    pull_parser.add_argument("model", help="Model name to pull")
+    pull_parser.add_argument("--host")
+    pull_parser.set_defaults(func=cmd_pull)
 
-    config_parser = subparsers.add_parser("config")
-    config_parser.add_argument("--host")
-    config_parser.set_defaults(func=cmd_config)
+    rm_parser = subparsers.add_parser("rm", aliases=["delete"], help="Remove a model")
+    rm_parser.add_argument("model", help="Model name to remove")
+    rm_parser.add_argument("--host")
+    rm_parser.set_defaults(func=cmd_rm)
+
+    stop_parser = subparsers.add_parser("stop", help="Stop a running model")
+    stop_parser.add_argument("model", help="Model name to stop")
+    stop_parser.add_argument("--host")
+    stop_parser.set_defaults(func=cmd_stop)
+
+    # Integration and Stub Commands
+    launch_parser = subparsers.add_parser("launch", help="Launch external integrations")
+    launch_parser.add_argument("integration", nargs="?", help="Integration name")
+    launch_parser.add_argument("--config", action="store_true")
+    launch_parser.add_argument("--model")
+    launch_parser.set_defaults(func=cmd_launch)
+
+    create_parser = subparsers.add_parser("create", help="Create a model from a Modelfile")
+    create_parser.add_argument("-f", "--file", help="Path to Modelfile")
+    create_parser.set_defaults(func=cmd_create)
+
+    signin_parser = subparsers.add_parser("signin", help="Sign in")
+    signin_parser.set_defaults(func=cmd_signin)
+
+    signout_parser = subparsers.add_parser("signout", help="Sign out")
+    signout_parser.set_defaults(func=cmd_signout)
 
     args = parser.parse_args()
+
     if not args.command:
         parser.print_help()
         sys.exit(0)
+
     args.func(args)
 
 

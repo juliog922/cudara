@@ -1,9 +1,7 @@
-# syntax=docker/dockerfile:1
-
 # -----------------------------------------------------------------------------
 # GLOBAL ARGS
 # -----------------------------------------------------------------------------
-ARG RUNTIME_IMAGE=nvidia/cuda:12.6.3-base-ubuntu24.04
+ARG RUNTIME_IMAGE=nvidia/cuda:12.9.0-runtime-ubuntu22.04
 
 # -----------------------------------------------------------------------------
 # RUNTIME STAGE (Single Stage Optimization)
@@ -11,59 +9,48 @@ ARG RUNTIME_IMAGE=nvidia/cuda:12.6.3-base-ubuntu24.04
 FROM ${RUNTIME_IMAGE} AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 1. Install Runtime Deps + 'binutils' (for stripping)
-# We install binutils temporarily to strip libraries, then remove it.
+# 1. Install Runtime Deps
+# Kept ffmpeg for the Transformers audio transcription pipeline.
+# Removed binutils because we no longer manually strip massive PyTorch binaries.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3-minimal \
-    python3-venv \
+    build-essential \
     libsndfile1 \
     libgomp1 \
     ca-certificates \
-    binutils \
     curl \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Install 'uv' directly (No builder stage needed for this)
+# 2. Install 'uv' directly (Multi-stage copy strategy)
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
 WORKDIR /app
 
 # 3. Configure UV
-# - UV_LINK_MODE=copy: Vital for Docker caching
-# - UV_COMPILE_BYTECODE=0: Disabling this makes builds faster & images smaller
+# - UV_LINK_MODE=copy: Vital for Docker caching across filesystems
+# - UV_COMPILE_BYTECODE=1: Precompiles Python bytecode for much faster app startup
 # - UV_PYTHON_DOWNLOADS=never: Use the system python we installed
-ENV UV_PYTHON_DOWNLOADS=never \
-    UV_PYTHON=python3 \
+ENV UV_PYTHON_DOWNLOADS=auto \
+    UV_PYTHON=3.12 \
     UV_LINK_MODE=copy \
-    UV_COMPILE_BYTECODE=0 \
-    # Use the pre-built CUDA wheels (Critical for speed)
-    UV_EXTRA_INDEX_URL="https://abetlen.github.io/llama-cpp-python/whl/cu124" \
+    UV_COMPILE_BYTECODE=1 \
     PATH="/app/.venv/bin:${PATH}"
 
 # 4. Copy Lockfiles
 COPY pyproject.toml uv.lock ./
 
-# 5. Install Dependencies DIRECTLY (The Speed Fix)
-# We mount the cache so 'uv' can link files instantly.
-# We remove 'uv.lock' first to force the wheel resolution (as discussed previously).
-# We also run the 'strip' command in the same layer to reduce size immediately.
+# 5. Install Dependencies DIRECTLY
+# We use uv sync to fetch all dependencies.
+# We removed the 'rm uv.lock' hack to ensure deterministic, locked builds.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    rm uv.lock && \
     uv sync --no-install-project --no-dev && \
-    # SURGICAL CLEANUP IN RUNTIME
-    # Remove heavy static libs and strip symbols to save space
+    # Surgical cleanup: Remove static archives to save space
     VENV_LIB=$(find .venv -name "site-packages" -type d | head -n 1) && \
-    find ${VENV_LIB} -name "*.so" -exec strip --strip-unneeded {} + 2>/dev/null || true && \
-    find ${VENV_LIB} -name "*.a" -delete && \
-    find ${VENV_LIB} -name "__pycache__" -exec rm -rf {} + && \
-    # Remove binutils to keep the final image clean
-    apt-get remove -y binutils && \
-    apt-get autoremove -y
+    find ${VENV_LIB} -name "*.a" -delete
 
 # 6. Copy Application Code
 COPY src/ src/
-COPY models.json swagger.yaml index.html ./
+COPY models.json ./
 
 # 7. Final Sync (Install the app itself)
 RUN --mount=type=cache,target=/root/.cache/uv \
