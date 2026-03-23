@@ -6,11 +6,13 @@ Definitive Unified Edition.
 
 import asyncio
 import base64
+import contextlib
 import datetime
 import gc
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import threading
@@ -451,18 +453,44 @@ class InferenceEngine:
         self.model: Optional[Any] = None
         self.tokenizer: Optional[Any] = None
         self.processor: Optional[Any] = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.last_interaction: float = 0.0
+        self.active_requests: int = 0
+        self.keep_alive_timeout: float = float(IDLE_TIMEOUT_SECONDS)
+
+    @contextlib.contextmanager
+    def request_context(self):
+        """Context manager to safely track when the GPU is busy."""
+        with self._lock:
+            self.active_requests += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self.active_requests -= 1
+                # Reset the idle timer ONLY when the generation actually finishes
+                self.last_interaction = time.time()
 
     def unload(self) -> None:
-        """Releases VRAM by deleting model instances and invoking garbage collection."""
-        if self.model:
-            logger.info(f"Unloading model {self.active_id} from VRAM.")
-            del self.model, self.tokenizer, self.processor
-            self.model = self.tokenizer = self.processor = self.active_id = None
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        """Releases VRAM by safely severing references and forcing PyTorch cleanup."""
+        with self._lock:  # Secure the thread so we don't unload during active use
+            if self.model is not None:
+                logger.info(f"Unloading model {self.active_id} from VRAM.")
+
+                # 1. Reassigning to None is safer and cleaner than using `del`
+                self.model = None
+                self.tokenizer = None
+                self.processor = None
+                self.active_id = None
+
+                # 2. Double GC pass. PyTorch cyclical references often survive a single pass.
+                gc.collect()
+                gc.collect()
+
+                # 3. Aggressively clear CUDA caches
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()  # Clears dead inter-process memory segments
 
     def load(self, model_id: str) -> None:
         """Loads model weights into VRAM."""
@@ -482,15 +510,18 @@ class InferenceEngine:
             dtype = torch.bfloat16 if device == "cuda" and torch.cuda.is_bf16_supported() else torch.float16
 
             logger.info(f"Loading {model_id} into VRAM...")
+            is_awq = "AWQ" in model_id.upper()
+            attn_impl = "eager" if is_awq else "sdpa"
+
             if config.task == "text-generation":
                 self.tokenizer = AutoTokenizer.from_pretrained(path)
                 self.model = AutoModelForCausalLM.from_pretrained(
-                    path, device_map="auto", dtype=dtype, attn_implementation="sdpa"
+                    path, device_map="auto", dtype=dtype, attn_implementation=attn_impl
                 )
             elif config.task == "image-to-text":
                 self.processor = AutoProcessor.from_pretrained(path)
                 self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                    path, device_map="auto", dtype=dtype, attn_implementation="sdpa"
+                    path, device_map="auto", dtype=dtype, attn_implementation=attn_impl
                 )
             elif config.task == "automatic-speech-recognition":
                 self.model = pipeline("automatic-speech-recognition", model=path, device=device, dtype=dtype)
@@ -558,45 +589,58 @@ class InferenceEngine:
             if "top_k" in options:
                 gen_kwargs["top_k"] = options["top_k"]
 
-        threading.Thread(target=self.model.generate, kwargs=gen_kwargs).start()
+        def _generate_with_error_handling():
+            try:
+                self.model.generate(**gen_kwargs)
+            except Exception as e:
+                logger.error(f"Generation thread crashed: {e}")
+                # Push the stop signal into the streamer queue to unblock the main thread
+                streamer.text_queue.put(streamer.stop_signal, timeout=streamer.timeout)
+
+        threading.Thread(target=_generate_with_error_handling).start()
 
         def sync_gen() -> Iterator[Any]:
-            full_txt = ""
-            thinking = ""
-            in_thought = False
-            t_count = 0
-            first_tok = None
+            with self.request_context():
+                full_txt = ""
+                thinking = ""
+                in_thought = False
+                t_count = 0
+                first_tok = None
 
-            for new_text in streamer:
-                if first_tok is None:
-                    first_tok = time.perf_counter()
-                t_count += 1
+                try:
+                    for new_text in streamer:
+                        if first_tok is None:
+                            first_tok = time.perf_counter()
+                        t_count += 1
 
-                if "<think>" in new_text:
-                    in_thought = True
-                    continue
-                if "</think>" in new_text:
-                    in_thought = False
-                    continue
+                        if "<think>" in new_text:
+                            in_thought = True
+                            continue
+                        if "</think>" in new_text:
+                            in_thought = False
+                            continue
 
-                if in_thought:
-                    thinking += new_text
-                else:
-                    full_txt += new_text
+                        if in_thought:
+                            thinking += new_text
+                        else:
+                            full_txt += new_text
 
-                if stream:
-                    chunk: Dict[str, Any] = {
-                        "model": model_id,
-                        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                        "done": False,
-                    }
-                    if is_chat:
-                        chunk["message"] = {"role": "assistant", "content": new_text}
-                    else:
-                        chunk["response"] = new_text
-                    if thinking:
-                        chunk["thinking"] = thinking
-                    yield json.dumps(chunk) + "\n"
+                        if stream:
+                            chunk: Dict[str, Any] = {
+                                "model": model_id,
+                                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                "done": False,
+                            }
+                            if is_chat:
+                                chunk["message"] = {"role": "assistant", "content": new_text}
+                            else:
+                                chunk["response"] = new_text
+                            if thinking:
+                                chunk["thinking"] = thinking
+                            yield json.dumps(chunk) + "\n"
+
+                except queue.Empty:
+                    logger.error("TextIteratorStreamer timed out. Model likely crashed.")
 
             eval_end = time.perf_counter()
 
@@ -738,12 +782,43 @@ def inject_json_instruction(messages: List[Dict[str, Any]], format_req: Union[st
 
 
 async def _handle_keep_alive(keep_alive: Union[str, int, None], model: str, engine_instance: InferenceEngine) -> bool:
-    """Determines if the model should be immediately unloaded based on keep_alive parameter."""
-    if keep_alive in [0, "0", "0s", "0m"]:
+    """Updates the dynamic keep-alive timeout or unloads the model immediately."""
+    if keep_alive is None:
+        return False
+
+    # Parse string formats like "5m", "1h", "-1"
+    timeout_seconds = 0.0
+    if isinstance(keep_alive, str):
+        keep_alive = keep_alive.lower().strip()
+        if keep_alive in ["0", "0s", "0m"]:
+            timeout_seconds = 0.0
+        elif keep_alive == "-1":
+            timeout_seconds = -1.0  # Infinite
+        elif keep_alive.endswith("h"):
+            timeout_seconds = float(keep_alive[:-1]) * 3600
+        elif keep_alive.endswith("m"):
+            timeout_seconds = float(keep_alive[:-1]) * 60
+        elif keep_alive.endswith("s"):
+            timeout_seconds = float(keep_alive[:-1])
+        else:
+            try:
+                timeout_seconds = float(keep_alive)
+            except ValueError:
+                timeout_seconds = float(IDLE_TIMEOUT_SECONDS)
+    else:
+        timeout_seconds = float(keep_alive)
+
+    # If timeout is 0, rip it out of VRAM immediately
+    if timeout_seconds == 0.0:
         if engine_instance.active_id == model:
             async with GPU_LOCK:
                 engine_instance.unload()
         return True
+
+    # Otherwise, update the engine's timeout clock
+    with engine_instance._lock:
+        engine_instance.keep_alive_timeout = timeout_seconds
+
     return False
 
 
@@ -762,8 +837,27 @@ def _extract_options(
 async def monitor_idle(eng: InferenceEngine) -> None:
     """Background task to automatically release VRAM based on inactivity."""
     while True:
-        await asyncio.sleep(60)
-        if eng.active_id and (time.time() - eng.last_interaction > IDLE_TIMEOUT_SECONDS):
+        await asyncio.sleep(15)  # Check more frequently (every 15s instead of 60s)
+
+        with eng._lock:
+            # 1. Is a model loaded?
+            if not eng.active_id:
+                continue
+
+            # 2. Is the GPU currently busy with a request?
+            if eng.active_requests > 0:
+                continue
+
+            # 3. Is it set to never expire? (-1.0)
+            if eng.keep_alive_timeout < 0:
+                continue
+
+            # 4. Has it exceeded the dynamic timeout?
+            time_idle = time.time() - eng.last_interaction
+            should_unload = time_idle > eng.keep_alive_timeout
+
+        # Unload OUTSIDE the sync lock using the async GPU lock
+        if should_unload:
             async with GPU_LOCK:
                 eng.unload()
 
@@ -954,10 +1048,6 @@ async def generate(req: GenerateRequest, bg: BackgroundTasks) -> Union[JSONRespo
                 return JSONResponse(content={"model": req.model, "response": res["text"], "done": True})
             finally:
                 tmp.unlink(missing_ok=True)
-
-            res = await asyncio.to_thread(engine.transcribe, req.model, str(tmp))
-            tmp.unlink(missing_ok=True)
-            return JSONResponse(content={"model": req.model, "response": res["text"], "done": True})
 
         messages = []
         if req.system:
