@@ -551,9 +551,9 @@ class InferenceEngine:
         dynamic_max_pixels = 1003520  # Default ~1024x1024
         if torch.cuda.is_available():
             free_vram, _ = torch.cuda.mem_get_info()
-            if free_vram < 4 * 1024**3:      # Under 4GB VRAM free
+            if free_vram < 4 * 1024**3:  # Under 4GB VRAM free
                 dynamic_max_pixels = 313600  # Cap at ~560x560
-            elif free_vram < 8 * 1024**3:    # Under 8GB VRAM free
+            elif free_vram < 8 * 1024**3:  # Under 8GB VRAM free
                 dynamic_max_pixels = 602112  # Cap at ~776x776
 
         # --- 2. ISOLATED PREPARATION PHASE ---
@@ -565,17 +565,19 @@ class InferenceEngine:
                     if m.get("images"):
                         for img in m["images"]:
                             # Pass max_pixels natively to qwen_vl_utils
-                            content.append({
-                                "type": "image", 
-                                "image": f"data:image/jpeg;base64,{img}",
-                                "max_pixels": dynamic_max_pixels
-                            })
+                            content.append(
+                                {
+                                    "type": "image",
+                                    "image": f"data:image/jpeg;base64,{img}",
+                                    "max_pixels": dynamic_max_pixels,
+                                }
+                            )
                     hf_msgs.append({"role": m["role"], "content": content})
                 text = self.processor.apply_chat_template(hf_msgs, tokenize=False, add_generation_prompt=True)
                 img_in, vid_in = process_vision_info(hf_msgs)
-                inputs = self.processor(text=[text], images=img_in, videos=vid_in, padding=True, return_tensors="pt").to(
-                    self.model.device
-                )
+                inputs = self.processor(
+                    text=[text], images=img_in, videos=vid_in, padding=True, return_tensors="pt"
+                ).to(self.model.device)
                 tok = self.processor.tokenizer
             elif self.tokenizer and self.model:
                 text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -622,10 +624,12 @@ class InferenceEngine:
                     torch.cuda.empty_cache()
                 # Push a controlled error message to the user, then stop the stream cleanly
                 try:
-                    streamer.text_queue.put(f"\n\n[System Notice: Inference aborted due to server error: {type(e).__name__}]", timeout=1.0)
+                    streamer.text_queue.put(
+                        f"\n\n[System Notice: Inference aborted due to server error: {type(e).__name__}]", timeout=1.0
+                    )
                     streamer.text_queue.put(streamer.stop_signal, timeout=1.0)
                 except Exception:
-                    pass # Ignore if queue is already closed
+                    pass  # Ignore if queue is already closed
 
         threading.Thread(target=_generate_with_error_handling).start()
 
