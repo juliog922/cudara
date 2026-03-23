@@ -540,32 +540,54 @@ class InferenceEngine:
         is_chat: bool,
         force_json: bool,
     ) -> Union[Iterator[str], Dict[str, Any]]:
-        """Core logic for text and multimodal generation operations."""
+        """Core logic for text and multimodal generation operations with dynamic limits and error isolation."""
         start_t = time.perf_counter()
         self.load(model_id)
         load_t = time.perf_counter() - start_t
         config = self.manager.get_allowed()[model_id]
 
-        if config.task == "image-to-text" and self.processor and self.model:
-            hf_msgs = []
-            for m in messages:
-                content = [{"type": "text", "text": m["content"]}]
-                if m.get("images"):
-                    for img in m["images"]:
-                        content.append({"type": "image", "image": f"data:image/jpeg;base64,{img}"})
-                hf_msgs.append({"role": m["role"], "content": content})
-            text = self.processor.apply_chat_template(hf_msgs, tokenize=False, add_generation_prompt=True)
-            img_in, vid_in = process_vision_info(hf_msgs)
-            inputs = self.processor(text=[text], images=img_in, videos=vid_in, padding=True, return_tensors="pt").to(
-                self.model.device
-            )
-            tok = self.processor.tokenizer
-        elif self.tokenizer and self.model:
-            text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
-            tok = self.tokenizer
-        else:
-            raise AppError("Model configuration invalid for text generation.", 500)
+        # --- 1. DYNAMIC IMAGE RESOLUTION CAPPING ---
+        # Heuristic: Adjust maximum pixels based on currently free VRAM
+        dynamic_max_pixels = 1003520  # Default ~1024x1024
+        if torch.cuda.is_available():
+            free_vram, _ = torch.cuda.mem_get_info()
+            if free_vram < 4 * 1024**3:      # Under 4GB VRAM free
+                dynamic_max_pixels = 313600  # Cap at ~560x560
+            elif free_vram < 8 * 1024**3:    # Under 8GB VRAM free
+                dynamic_max_pixels = 602112  # Cap at ~776x776
+
+        # --- 2. ISOLATED PREPARATION PHASE ---
+        try:
+            if config.task == "image-to-text" and self.processor and self.model:
+                hf_msgs = []
+                for m in messages:
+                    content = [{"type": "text", "text": m["content"]}]
+                    if m.get("images"):
+                        for img in m["images"]:
+                            # Pass max_pixels natively to qwen_vl_utils
+                            content.append({
+                                "type": "image", 
+                                "image": f"data:image/jpeg;base64,{img}",
+                                "max_pixels": dynamic_max_pixels
+                            })
+                    hf_msgs.append({"role": m["role"], "content": content})
+                text = self.processor.apply_chat_template(hf_msgs, tokenize=False, add_generation_prompt=True)
+                img_in, vid_in = process_vision_info(hf_msgs)
+                inputs = self.processor(text=[text], images=img_in, videos=vid_in, padding=True, return_tensors="pt").to(
+                    self.model.device
+                )
+                tok = self.processor.tokenizer
+            elif self.tokenizer and self.model:
+                text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+                tok = self.tokenizer
+            else:
+                raise AppError("Model configuration invalid for text generation.", 500)
+        except Exception as e:
+            logger.error(f"Inference preparation crashed: {e}")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()  # Clean up stranded memory immediately
+            raise AppError(f"Inference preparation failed: {str(e)}", 500)
 
         prompt_eval_count = inputs.input_ids.shape[1]
         eval_start_t = time.perf_counter()
@@ -589,13 +611,21 @@ class InferenceEngine:
             if "top_k" in options:
                 gen_kwargs["top_k"] = options["top_k"]
 
+        # --- 3. ISOLATED GENERATION THREAD ---
         def _generate_with_error_handling():
             try:
                 self.model.generate(**gen_kwargs)
             except Exception as e:
                 logger.error(f"Generation thread crashed: {e}")
-                # Push the stop signal into the streamer queue to unblock the main thread
-                streamer.text_queue.put(streamer.stop_signal, timeout=streamer.timeout)
+                # Aggressive cleanup if an OOM happens mid-generation
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                # Push a controlled error message to the user, then stop the stream cleanly
+                try:
+                    streamer.text_queue.put(f"\n\n[System Notice: Inference aborted due to server error: {type(e).__name__}]", timeout=1.0)
+                    streamer.text_queue.put(streamer.stop_signal, timeout=1.0)
+                except Exception:
+                    pass # Ignore if queue is already closed
 
         threading.Thread(target=_generate_with_error_handling).start()
 
@@ -641,6 +671,8 @@ class InferenceEngine:
 
                 except queue.Empty:
                     logger.error("TextIteratorStreamer timed out. Model likely crashed.")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
             eval_end = time.perf_counter()
 
