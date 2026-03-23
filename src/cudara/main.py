@@ -38,6 +38,8 @@ from transformers import (
     AutoModelForSequenceClassification,
     AutoProcessor,
     AutoTokenizer,
+    LogitsProcessor,
+    LogitsProcessorList,
     Qwen2_5_VLForConditionalGeneration,
     TextIteratorStreamer,
     pipeline,
@@ -444,6 +446,17 @@ class ModelManager:
             self._save_json(Path("registry.json"), reg)
 
 
+class NaNSanitizerProcessor(LogitsProcessor):
+    """Intercepts NaN/Inf logits caused by FP16 overflow and sanitizes them before sampling."""
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        """Intercepts NaN/Inf logits caused by FP16 overflow and sanitizes them before sampling."""
+        if torch.isnan(scores).any() or torch.isinf(scores).any():
+            # In-place conversion: NaNs become -inf (0 probability during softmax)
+            scores.nan_to_num_(nan=-float("inf"), posinf=float("max"), neginf=-float("inf"))
+        return scores
+
+
 class InferenceEngine:
     """Handles PyTorch and Transformers inference operations."""
 
@@ -597,10 +610,15 @@ class InferenceEngine:
         streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True, timeout=15.0)
         temp = options.get("temperature", 0.8)
 
+        # Initialize and attach the custom logits processor
+        processors = LogitsProcessorList()
+        processors.append(NaNSanitizerProcessor())
+
         gen_kwargs: Dict[str, Any] = {
             **inputs,
             "streamer": streamer,
             "max_new_tokens": options.get("num_predict", 512),
+            "logits_processor": processors,  # INJECTED HERE
         }
 
         if temp <= 0.0:
@@ -618,18 +636,19 @@ class InferenceEngine:
             try:
                 self.model.generate(**gen_kwargs)
             except Exception as e:
-                logger.error(f"Generation thread crashed: {e}")
-                # Aggressive cleanup if an OOM happens mid-generation
+                logger.error(f"Generation thread crashed: {e}", exc_info=True)
+                # Aggressive cleanup if an OOM or math error happens mid-generation
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
                 # Push a controlled error message to the user, then stop the stream cleanly
                 try:
                     streamer.text_queue.put(
                         f"\n\n[System Notice: Inference aborted due to server error: {type(e).__name__}]", timeout=1.0
                     )
                     streamer.text_queue.put(streamer.stop_signal, timeout=1.0)
-                except Exception:
-                    pass  # Ignore if queue is already closed
+                except Exception as queue_err:
+                    logger.error(f"Failed to push error signal to stream queue: {queue_err}")
 
         threading.Thread(target=_generate_with_error_handling).start()
 
