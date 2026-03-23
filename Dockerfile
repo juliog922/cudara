@@ -52,6 +52,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY src/ src/
 COPY models.json ./
 
+RUN mkdir -p /app/models && \
+    echo "{}" > /app/registry.json && \
+    chmod -R 777 /app/models /app/registry.json
+    
 # 7. Final Sync (Install the app itself)
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --no-dev --no-editable
