@@ -452,8 +452,14 @@ class NaNSanitizerProcessor(LogitsProcessor):
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         """Intercepts NaN/Inf logits caused by FP16 overflow and sanitizes them before sampling."""
         if torch.isnan(scores).any() or torch.isinf(scores).any():
-            # In-place conversion: NaNs become -inf (0 probability during softmax)
-            scores.nan_to_num_(nan=-float("inf"), posinf=float("max"), neginf=-float("inf"))
+            # Dynamically get the safest max/min finite values for the current dtype (e.g., float16)
+            dtype_min = torch.finfo(scores.dtype).min
+            dtype_max = torch.finfo(scores.dtype).max
+
+            # In-place conversion:
+            # NaNs and -Infs become the lowest finite value (0 probability after softmax)
+            # +Infs become the highest finite value
+            scores.nan_to_num_(nan=dtype_min, posinf=dtype_max, neginf=dtype_min)
         return scores
 
 
