@@ -12,7 +12,7 @@ env:
 
 jobs:
   lint:
-    name: Lint
+    name: Lint & Typecheck
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,16 +26,19 @@ jobs:
         run: uv python install ${{ env.PYTHON_VERSION }}
 
       - name: Install dependencies
-        run: uv sync --dev
+        run: uv sync --dev --extra vlm
 
-      - name: Run Ruff linter
+      - name: Ruff lint
         run: uv run ruff check src/ tests/
 
-      - name: Run Ruff formatter check
+      - name: Ruff format check
         run: uv run ruff format --check src/ tests/
 
+      - name: Mypy type check
+        run: uv run mypy src/cudara/ --ignore-missing-imports
+
   test:
-    name: Run Tests
+    name: Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,11 +52,18 @@ jobs:
         run: uv python install ${{ env.PYTHON_VERSION }}
 
       - name: Install dependencies
-        run: uv sync --dev
+        run: uv sync --dev --extra vlm
 
-      - name: Run all tests
-        # This will discover and run all tests (like test_client.py) without needing a real model
-        run: uv run pytest
+      - name: Run tests with coverage
+        run: uv run pytest --cov=src/cudara --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 7
 
   build-check:
     name: Build Check
@@ -64,13 +74,16 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v4
         with:
-          python-version: "3.12"
+          version: "latest"
           enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
 
       - name: Build package
         run: uv build
 
-      - name: Check package
+      - name: Validate package
         run: uv tool run twine check dist/*
 
   docker-build-test:
@@ -78,15 +91,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Free Disk Space
+
+      - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/share/swift
-          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/.ghcup
           sudo docker image prune --all --force
 
       - name: Set up Docker Buildx
@@ -102,7 +111,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   docker-publish:
-    name: Docker Build & Publish (GHCR)
+    name: Publish Docker Image
     needs: [lint, test, build-check, docker-build-test]
     if: github.event_name == 'push'
     permissions:

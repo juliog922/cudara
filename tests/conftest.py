@@ -1,3 +1,7 @@
+"""Shared test fixtures for Cudara API and CLI tests."""
+
+from __future__ import annotations
+
 import json
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -10,13 +14,13 @@ from cudara.main import AppError, ModelConfig, ModelStatus, RegistryItem, app, e
 
 @pytest.fixture
 def client():
-    """Provides a FastAPI TestClient for routing requests."""
-    return TestClient(app)
+    """FastAPI TestClient wired to the application."""
+    return TestClient(app, raise_server_exceptions=False)
 
 
 @pytest.fixture(autouse=True)
 def mock_registry_and_engine(monkeypatch):
-    """Mocks the filesystem registry and the PyTorch InferenceEngine."""
+    """Mock the filesystem registry and InferenceEngine for unit tests."""
 
     mock_allowed = {
         "Qwen/Qwen2.5-3B-Instruct-AWQ": ModelConfig(task="text-generation"),
@@ -27,18 +31,22 @@ def mock_registry_and_engine(monkeypatch):
     }
     monkeypatch.setattr(manager, "get_allowed", lambda: mock_allowed)
 
-    # Point to the current tests directory so Path.exists() evaluates to True
+    # Use the tests directory as a real path so Path.exists() returns True
     fake_path = str(Path(__file__).parent.resolve())
-    mock_registry = {k: RegistryItem(status=ModelStatus.READY, local_path=fake_path) for k in mock_allowed.keys()}
+    mock_registry = {k: RegistryItem(status=ModelStatus.READY, local_path=fake_path) for k in mock_allowed}
     monkeypatch.setattr(manager, "get_registry", lambda: mock_registry)
 
-    # Mock the InferenceEngine
+    # Stub engine lifecycle
     monkeypatch.setattr(engine, "load", MagicMock())
     monkeypatch.setattr(engine, "unload", MagicMock())
 
+    # --- Mock chat ---
     def mock_chat(model_id, messages, options, stream, is_chat, force_json):
         if model_id not in mock_allowed:
             raise AppError(f"Model '{model_id}' not found", 404)
+
+        thinking = "Dummy thought process" if options.get("think") else None
+        content = "Mocked JSON" if force_json else "Mocked response"
 
         res = {
             "model": model_id,
@@ -52,9 +60,6 @@ def mock_registry_and_engine(monkeypatch):
             "eval_duration": 500,
         }
 
-        thinking = "Dummy thought process" if options.get("think") else None
-        content = "Mocked JSON" if force_json else "Mocked response"
-
         if is_chat:
             res["message"] = {"role": "assistant", "content": content}
         else:
@@ -63,17 +68,17 @@ def mock_registry_and_engine(monkeypatch):
         if thinking:
             res["thinking"] = thinking
 
-        # FIX: Explicitly return a dict if not streaming!
         if stream:
 
-            def stream_generator():
+            def _gen():
                 yield json.dumps(res) + "\n"
 
-            return stream_generator()
+            return _gen()
         return res
 
     monkeypatch.setattr(engine, "chat", mock_chat)
 
+    # --- Mock embeddings ---
     def mock_embeddings(model_id, texts, truncate, dimensions=None):
         size = dimensions if dimensions else 384
         return {
@@ -85,12 +90,22 @@ def mock_registry_and_engine(monkeypatch):
 
     monkeypatch.setattr(engine, "embeddings", mock_embeddings)
 
+    # --- Mock rerank ---
     def mock_rerank(model_id, query, docs):
-        return {"model": model_id, "scores": [0.99, 0.5, 0.1][: len(docs)], "total_duration": 50}
+        return {
+            "model": model_id,
+            "scores": [0.99, 0.5, 0.1][: len(docs)],
+            "total_duration": 50,
+        }
 
     monkeypatch.setattr(engine, "rerank", mock_rerank)
 
+    # --- Mock transcribe ---
     def mock_transcribe(model_id, path):
-        return {"model": model_id, "text": "Mocked audio transcription.", "total_duration": 200}
+        return {
+            "model": model_id,
+            "text": "Mocked audio transcription.",
+            "total_duration": 200,
+        }
 
     monkeypatch.setattr(engine, "transcribe", mock_transcribe)

@@ -1,6 +1,6 @@
 [project]
 name = "cudara"
-version = "0.0.1"
+version = "0.1.44"
 description = "Lightweight CUDA inference server with Ollama-compatible API"
 readme = "README.md"
 license = {text = "MIT"}
@@ -13,7 +13,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Framework :: FastAPI",
@@ -26,13 +25,16 @@ dependencies = [
     "fastapi>=0.128.0",
     "huggingface-hub>=0.36.0",
     "pydantic>=2.12.3",
-    "qwen-vl-utils>=0.0.14",
     "torch>=2.9.1",
     "torchaudio>=2.9.1",
     "torchvision>=0.24.1",
     "transformers>=4.51.0",
     "uvicorn>=0.38.0",
 ]
+
+[project.optional-dependencies]
+vlm = ["qwen-vl-utils>=0.0.14"]
+all = ["cudara[vlm]"]
 
 [project.urls]
 Homepage = "https://github.com/juliog922/cudara"
@@ -71,7 +73,7 @@ explicit = true
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu129" }]
 torchaudio = [{ index = "pytorch-cu129" }]
-torchvision = [{ index = "pytorch-cu129" }] # Added this to match torch/torchaudio mapping
+torchvision = [{ index = "pytorch-cu129" }]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -95,14 +97,14 @@ exclude_lines = [
 ]
 
 [project.scripts]
-cudara = "cudara.main:app"
+cudara = "cudara.cli:main"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "D1"]
 ignore = ["D100", "D104", "D107"]
 
 [tool.ruff.lint.pydocstyle]
-convention = "google" 
+convention = "google"
 
 [tool.ruff]
 line-length = 120
